@@ -4,45 +4,38 @@
 
 class Ads1256 {
    public:
-    // csPin = chip select GPIO, drdyPin = DRDY GPIO
     Ads1256(int csPin, int drdyPin);
 
-    // Initialize the ADS1256 on the given SPI bus (e.g. SPI, SPI1).
-    // Returns true on success.
     bool begin(SPIClass& spi);
-
-    // Start continuous (RDATAC) mode. The 'ch' parameter is currently unused,
-    // but kept for API compatibility / future channel control.
     void startContinuous(uint8_t ch = 0);
-
-    // Stop continuous (RDATAC) mode.
     void stopContinuous();
 
     // Channel switching for voltage/current measurements
     void switchToVoltageChannel();
     void switchToCurrentChannel();
+    bool zeroCalibrateRaw(uint16_t samples = 200);
 
-    // Non-blocking:
-    //  - returns true if DRDY was low and a new sample was read.
-    //  - 'amps' will then contain the converted current value.
-    //  - returns false if DRDY was high (no new sample yet).
+    // Non‑blocking: returns true if a new sample was read and 'amps' is valid.
     bool readCurrentFast(float& amps);
     bool readVoltageFast(float& volts);
+
+    // Public debug access
+    void sendCommand(uint8_t cmd);
+    void writeRegister(uint8_t reg, uint8_t value);
+    uint8_t readRegister(uint8_t reg);
+    long readData();  // raw signed 24‑bit
 
    private:
     int _cs;
     int _drdy;
     SPIClass* _spi;
+    float medianOf3(float a, float b, float c);
 
-    inline void csLow() { digitalWrite(_cs, LOW); }
-    inline void csHigh() { digitalWrite(_cs, HIGH); }
+    void csLow() { digitalWrite(_cs, LOW); }
+    void csHigh() { digitalWrite(_cs, HIGH); }
 
-    void sendCommand(uint8_t cmd);
-    void writeRegister(uint8_t reg, uint8_t value);
-    uint8_t readRegister(uint8_t reg);
+    // Read 24-bit data in continuous mode (no DRDY wait, no command overhead)
+    long readDataContinuous();
 
-    // Read one 24-bit signed conversion result from the ADS1256.
-    long readData();
-
-    inline bool drdyLow() const { return digitalRead(_drdy) == LOW; }
+    bool drdyLow() const { return digitalRead(_drdy) == LOW; }
 };

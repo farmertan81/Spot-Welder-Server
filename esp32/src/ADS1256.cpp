@@ -1,5 +1,7 @@
 #include "ADS1256.h"
 
+#include <limits.h>
+
 // ---- ADS1256 command & register definitions ----
 enum {
     CMD_WAKEUP = 0x00,
@@ -9,7 +11,8 @@ enum {
     CMD_RREG = 0x10,
     CMD_WREG = 0x50,
     CMD_SELFCAL = 0xF0,
-    CMD_RESET = 0xFE
+    CMD_RESET = 0xFE,
+    CMD_SYNC = 0xFC
 };
 
 enum {
@@ -18,6 +21,10 @@ enum {
     REG_ADCON = 0x02,
     REG_DRATE = 0x03,
 };
+
+// Raw-code zero offset (ADC codes at "no current")
+static long g_raw_zero = 0;
+static bool g_has_zero = false;
 
 Ads1256::Ads1256(int csPin, int drdyPin)
     : _cs(csPin), _drdy(drdyPin), _spi(nullptr) {}
@@ -29,27 +36,66 @@ bool Ads1256::begin(SPIClass& spi) {
     pinMode(_drdy, INPUT);
     csHigh();
 
-    // Reset sequence
+    delay(200);
+
+    // Stop continuous mode (safe)
     sendCommand(CMD_SDATAC);
-    delay(2);
+    delay(20);
+
+    // Reset
     sendCommand(CMD_RESET);
-    delay(5);
+    delay(200);
+
+    // Stop continuous mode again
     sendCommand(CMD_SDATAC);
-    delay(5);
+    delay(20);
 
-    // Configure: 30 kSPS, PGA=1, differential mode
-    writeRegister(REG_DRATE, 0xF0);  // 30,000 SPS
-    writeRegister(REG_ADCON, 0x00);  // PGA=1, CLKOUT off
-    writeRegister(REG_MUX, 0x23);    // AIN2-AIN3 (current channel)
+    // SYNC + WAKEUP
+    sendCommand(CMD_SYNC);
+    delayMicroseconds(5);
+    sendCommand(CMD_WAKEUP);
+    delay(50);
 
-    // Self-calibration
-    sendCommand(CMD_SELFCAL);
-    unsigned long t0 = millis();
-    while (!drdyLow() && (millis() - t0) < 1000) {
+    // Wait for DRDY low
+    unsigned long timeout = millis();
+    while (digitalRead(_drdy) == HIGH) {
+        if (millis() - timeout > 1000) {
+            Serial.println("❌ ADS1256: DRDY timeout during init");
+            return false;
+        }
         delay(1);
     }
 
-    Serial.println("ADS1256: initialized at 30kSPS");
+    // Registers
+    writeRegister(REG_DRATE, 0xA1);  // 10000 sps
+    uint8_t dr = readRegister(REG_DRATE);
+    Serial.printf("ADS1256 DRATE reg = 0x%02X (expect 0xA1)\n", dr);
+    writeRegister(REG_ADCON, 0x00);  // PGA = 1
+    writeRegister(REG_MUX,
+                  0x23);  // CURRENT default: AIN2 - AIN3 (AMC1311 diff)
+
+    // SYNC + WAKEUP after register config
+    sendCommand(CMD_SYNC);
+    delayMicroseconds(5);
+    sendCommand(CMD_WAKEUP);
+    delay(50);
+
+    // Self-cal
+    sendCommand(CMD_SELFCAL);
+    timeout = millis();
+    while (digitalRead(_drdy) == HIGH) {
+        if (millis() - timeout > 2000) {
+            Serial.println("❌ ADS1256: Calibration timeout");
+            return false;
+        }
+        delay(1);
+    }
+
+    // Zero not yet calibrated
+    g_has_zero = false;
+    g_raw_zero = 0;
+
+    Serial.println("✅ ADS1256: initialized at 10 SPS");
     return true;
 }
 
@@ -59,8 +105,13 @@ void Ads1256::startContinuous(uint8_t ch) {
     sendCommand(CMD_SDATAC);
     delayMicroseconds(5);
 
-    // Start on current channel (AIN2-AIN3)
-    writeRegister(REG_MUX, 0x23);
+    // ch=0: voltage AIN0-AINCOM
+    // ch=1: current  AIN2-AIN3
+    if (ch == 0) {
+        writeRegister(REG_MUX, 0x08);  // AIN0 - AINCOM
+    } else {
+        writeRegister(REG_MUX, 0x23);  // AIN2 - AIN3
+    }
     delayMicroseconds(10);
 
     sendCommand(CMD_RDATAC);
@@ -72,71 +123,99 @@ void Ads1256::stopContinuous() {
 }
 
 void Ads1256::switchToVoltageChannel() {
-    if (!_spi) return;
-    sendCommand(CMD_SDATAC);
+    stopContinuous();
+    writeRegister(REG_MUX, 0x08);  // AIN0 - AINCOM
+    sendCommand(CMD_SYNC);
     delayMicroseconds(5);
-    writeRegister(REG_MUX, 0x01);  // AIN0-AIN1
+    sendCommand(CMD_WAKEUP);
     delayMicroseconds(5);
-    sendCommand(CMD_RDATAC);
+    startContinuous(0);
 }
 
 void Ads1256::switchToCurrentChannel() {
-    if (!_spi) return;
-    sendCommand(CMD_SDATAC);
+    stopContinuous();
+    writeRegister(REG_MUX, 0x23);  // AIN2 - AIN3
+    sendCommand(CMD_SYNC);
     delayMicroseconds(5);
-    writeRegister(REG_MUX, 0x23);  // AIN2-AIN3
+    sendCommand(CMD_WAKEUP);
     delayMicroseconds(5);
-    sendCommand(CMD_RDATAC);
+    startContinuous(1);
 }
 
-bool Ads1256::readVoltageFast(float& volts) {
+// Median filter helper
+float Ads1256::medianOf3(float a, float b, float c) {
+    if (a > b) {
+        if (b > c)
+            return b;
+        else if (a > c)
+            return a;
+        else
+            return c;
+    } else {
+        if (a > c)
+            return a;
+        else if (b > c)
+            return c;
+        else
+            return b;
+    }
+}
+
+bool Ads1256::zeroCalibrateRaw(uint16_t samples) {
     if (!_spi) return false;
-    if (!drdyLow()) return false;
 
-    long raw = readData();
+    long long sum = 0;
+    uint16_t got = 0;
 
-    // ADC scaling
-    const float VREF = 2.5f;
-    const float FS = 8388607.0f;  // 2^23 - 1
-    float v_adc = (float)raw * (VREF / FS);
+    for (uint16_t i = 0; i < samples; i++) {
+        long raw = readDataContinuous();
+        if (raw == LONG_MIN) continue;
+        sum += raw;
+        got++;
+        delayMicroseconds(200);
+    }
 
-    // AMC1311 specs: 8.2× gain, 1V offset at zero input
-    // Voltage divider: (68k + 10k) / 10k = 7.8
-    const float V_OFFSET = 1.0f;
-    const float AMC_GAIN = 8.2f;
-    const float DIVIDER_RATIO = 7.8f;
+    if (got < (samples / 2)) {
+        g_has_zero = false;
+        return false;
+    }
 
-    float v_pack = ((v_adc - V_OFFSET) / AMC_GAIN) * DIVIDER_RATIO;
-
-    volts = v_pack;
+    g_raw_zero = (long)(sum / got);
+    g_has_zero = true;
     return true;
 }
 
 bool Ads1256::readCurrentFast(float& amps) {
     if (!_spi) return false;
-    if (!drdyLow()) return false;
 
-    long raw = readData();
+    long raw = readDataContinuous();
+    if (raw == LONG_MIN) return false;  // no fresh sample
+    if (!g_has_zero) return false;      // must zero-cal first
 
-    // ADC scaling
+    // remove ADC baseline in codes
+    raw -= g_raw_zero;
+
     const float VREF = 2.5f;
-    const float FS = 8388607.0f;  // 2^23 - 1
-    float v_adc = (float)raw * (VREF / FS);
+    const float FS = 8388607.0f;
+    float v_adc = (float)raw * (VREF / FS);  // zeroed differential volts
 
-    // AMC1311 specs: 8.2× gain, 1V offset at zero current
-    // Shunt: 50µΩ = 0.00005Ω
-    // Current = (V_adc - 1.0V) / (8.2 × 0.00005)
-    const float V_OFFSET = 1.0f;
-    const float SHUNT_R = 0.00005f;  // 50µΩ
-    const float AMC_GAIN = 8.2f;
+    const float SHUNT_R = 0.00005f;  // 50 µΩ
+    const float AMC_GAIN = 1.0f;
 
-    float current = (v_adc - V_OFFSET) / (AMC_GAIN * SHUNT_R);
+    float raw_current = v_adc / (AMC_GAIN * SHUNT_R);
 
-    amps = current;
+    // Optional light filtering (keep your median-of-3 behavior)
+    static float prev1 = 0;
+    static float prev2 = 0;
+    float filtered_current = medianOf3(prev2, prev1, raw_current);
+    prev2 = prev1;
+    prev1 = raw_current;
+
+    amps = filtered_current;
     return true;
 }
 
-// ---- Low‑level helpers ----
+// ---- Low-level helpers ----
 
 void Ads1256::sendCommand(uint8_t cmd) {
     if (!_spi) return;
@@ -152,7 +231,7 @@ void Ads1256::writeRegister(uint8_t reg, uint8_t value) {
     _spi->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE1));
     csLow();
     _spi->transfer(CMD_WREG | (reg & 0x0F));
-    _spi->transfer(0x00);
+    _spi->transfer(0x00);  // write 1 register
     _spi->transfer(value);
     csHigh();
     _spi->endTransaction();
@@ -164,7 +243,7 @@ uint8_t Ads1256::readRegister(uint8_t reg) {
     _spi->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE1));
     csLow();
     _spi->transfer(CMD_RREG | (reg & 0x0F));
-    _spi->transfer(0x00);
+    _spi->transfer(0x00);  // read 1 register
     delayMicroseconds(5);
     uint8_t v = _spi->transfer(0xFF);
     csHigh();
@@ -173,7 +252,8 @@ uint8_t Ads1256::readRegister(uint8_t reg) {
 }
 
 long Ads1256::readData() {
-    if (!_spi) return 0;
+    if (!_spi) return LONG_MIN;
+
     _spi->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE1));
     csLow();
     uint8_t b0 = _spi->transfer(0xFF);
@@ -183,11 +263,27 @@ long Ads1256::readData() {
     _spi->endTransaction();
 
     long raw = ((long)b0 << 16) | ((long)b1 << 8) | b2;
-
-    // 24-bit sign extension
-    if (raw & 0x800000) {
-        raw |= 0xFF000000;
-    }
-
+    if (raw & 0x800000) raw |= 0xFF000000;  // sign extend 24-bit
     return raw;
+}
+
+    long Ads1256::readDataContinuous() {
+        if (!_spi) return LONG_MIN;
+
+        // Non-blocking: if no new conversion ready, return immediately
+        if (digitalRead(_drdy) == HIGH) {
+            return LONG_MIN;
+        }
+
+        _spi->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE1));
+        csLow();
+        uint8_t b0 = _spi->transfer(0xFF);
+        uint8_t b1 = _spi->transfer(0xFF);
+        uint8_t b2 = _spi->transfer(0xFF);
+        csHigh();
+        _spi->endTransaction();
+
+        long raw = ((long)b0 << 16) | ((long)b1 << 8) | b2;
+        if (raw & 0x800000) raw |= 0xFF000000;
+        return raw;
 }
