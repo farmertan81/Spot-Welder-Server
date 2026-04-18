@@ -36,3 +36,4 @@ esp32/*.pre_esp_pull_*
 esp32/*.pre_git_sync_*
 esp32/main_from_esp_live.py
 esp32/wifi_config_from_esp_live.py
+.venv/
