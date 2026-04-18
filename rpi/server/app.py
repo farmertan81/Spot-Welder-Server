@@ -3,37 +3,59 @@ Flask + SocketIO server for ESP32 spot welder control
 Handles TCP connection, web UI, and real-time updates
 """
 
+import eventlet
+eventlet.monkey_patch()
+
 import os
 import json
 import time
 import socket
-import threading
 from datetime import datetime
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
 
 # ========== CONFIGURATION ==========
-ESP32_IP = "192.168.68.56"  # Change to your ESP32's IP
+ESP32_IP = "192.168.68.77"
 ESP32_PORT = 8888
 SETTINGS_FILE = "settings.json"
 PRESETS_FILE = "presets.json"
 LOG_FILE = "welder.log"
 
+CONNECT_TIMEOUT_S = 3.0
+RECV_TIMEOUT_S = 1.0
+NO_TELEM_GRACE_S = 12.0
+NO_TELEM_RECONNECT_S = 120.0
+RECONNECT_BASE_DELAY_S = 1.0
+RECONNECT_MAX_DELAY_S = 8.0
+
+HEARTBEAT_INTERVAL_S = 5.0  # Send PING every 5 seconds to keep connection alive
+
+# Filter tiny INA226 charger-current noise from STATUS2 before UI emit.
+# Values below this threshold are treated as 0.0A to suppress phantom flashes.
+STATUS2_CHARGE_NOISE_THRESHOLD_A = 0.2
+
+# Deadband for pack voltage display smoothing (STATUS2 INA226 telemetry).
+# UI voltage is only allowed to move if absolute change exceeds this threshold.
+STATUS2_VPACK_DEADBAND_V = 0.08
+
+# If your ESP supports a "CELLS" command, keep True. Otherwise set False.
+REQUEST_CELLS_ON_CONNECT = True
+
 # ========== FLASK SETUP ==========
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "spot-welder-secret-2024"
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 # ========== GLOBAL STATE ==========
 esp_link = None
 esp_connected = False
 last_status = {}
 current_settings = {}
+_esp_manager_started = False
 
 
 # ========== LOGGING ==========
-def log(msg):
-    """Log message to console and file"""
+def log(msg: str) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_line = f"[{timestamp}] {msg}"
     print(log_line)
@@ -44,100 +66,364 @@ def log(msg):
         print(f"⚠️ Failed to write log: {e}")
 
 
+def emit_status_update(patch: dict | None = None) -> None:
+    """
+    Emit a single merged status_update payload to the UI.
+
+    - Merges `patch` into `last_status`
+    - Always includes `esp_connected`
+    """
+    global last_status, esp_connected
+    try:
+        if patch:
+            last_status.update(patch)
+        payload = {**last_status, "esp_connected": esp_connected}
+        socketio.emit("status_update", payload)
+    except Exception as e:
+        log(f"⚠️ emit_status_update failed: {e}")
+
+
+# ========== SETTINGS / PRESETS ==========
+def load_settings() -> dict:
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                settings = json.load(f)
+
+            # Backfill new keys if missing
+            if "trigger_mode" not in settings:
+                settings["trigger_mode"] = "pedal"
+            if "contact_hold_steps" not in settings:
+                settings["contact_hold_steps"] = 2
+
+            return settings
+        except Exception as e:
+            log(f"⚠️ Failed to load settings: {e}")
+
+    return {
+        "mode": 1,
+        "d1": 50,
+        "gap1": 0,
+        "d2": 0,
+        "gap2": 0,
+        "d3": 0,
+        "power": 100,
+        "preheat_enabled": False,
+        "preheat_duration": 20,
+        "preheat_power": 30,
+        "preheat_gap_ms": 3,
+        "active_preset": None,
+        "trigger_mode": "pedal",
+        "contact_hold_steps": 2,
+    }
+
+
+def save_settings(settings: dict) -> bool:
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(settings, f, indent=2)
+        return True
+    except Exception as e:
+        log(f"⚠️ Failed to save settings: {e}")
+        return False
+
+
+def load_presets() -> dict:
+    if os.path.exists(PRESETS_FILE):
+        try:
+            with open(PRESETS_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            log(f"⚠️ Failed to load presets: {e}")
+
+    return {
+        "P1": {
+            "name": "Preset 1",
+            "mode": 1,
+            "d1": 50,
+            "gap1": 0,
+            "d2": 0,
+            "gap2": 0,
+            "d3": 0,
+            "power": 100,
+            "preheat_enabled": False,
+            "preheat_duration": 20,
+            "preheat_power": 30,
+            "preheat_gap_ms": 3
+        },
+        "P2": {
+            "name": "Preset 2",
+            "mode": 1,
+            "d1": 80,
+            "gap1": 0,
+            "d2": 0,
+            "gap2": 0,
+            "d3": 0,
+            "power": 100,
+            "preheat_enabled": False,
+            "preheat_duration": 20,
+            "preheat_power": 30,
+            "preheat_gap_ms": 3
+        },
+        "P3": {
+            "name": "Preset 3",
+            "mode": 2,
+            "d1": 50,
+            "gap1": 10,
+            "d2": 50,
+            "gap2": 0,
+            "d3": 0,
+            "power": 100,
+            "preheat_enabled": False,
+            "preheat_duration": 20,
+            "preheat_power": 30,
+            "preheat_gap_ms": 3
+        },
+        "P4": {
+            "name": "Preset 4",
+            "mode": 1,
+            "d1": 100,
+            "gap1": 0,
+            "d2": 0,
+            "gap2": 0,
+            "d3": 0,
+            "power": 100,
+            "preheat_enabled": False,
+            "preheat_duration": 20,
+            "preheat_power": 30,
+            "preheat_gap_ms": 3
+        },
+        "P5": {
+            "name": "Preset 5",
+            "mode": 3,
+            "d1": 40,
+            "gap1": 10,
+            "d2": 40,
+            "gap2": 10,
+            "d3": 40,
+            "power": 100,
+            "preheat_enabled": False,
+            "preheat_duration": 20,
+            "preheat_power": 30,
+            "preheat_gap_ms": 3
+        },
+    }
+
+
+def save_presets(presets: dict) -> bool:
+    try:
+        with open(PRESETS_FILE, "w") as f:
+            json.dump(presets, f, indent=2)
+        return True
+    except Exception as e:
+        log(f"⚠️ Failed to save presets: {e}")
+        return False
+
+
+
+def push_settings_to_esp(log_prefix: str = "") -> None:
+    """
+    Push current_settings to ESP so ESP matches UI after reboot/reconnect.
+
+    IMPORTANT:
+    - Do NOT request STATUS after each SET_*; ESP is already pushing STATUS/CELLS periodically.
+    """
+    global esp_link, current_settings
+
+    if not (esp_link and esp_link.connected):
+        return
+
+    s = current_settings or load_settings()
+
+    mode = s.get("mode", 1)
+    d1 = s.get("d1", 50)
+    gap1 = s.get("gap1", 0)
+    d2 = s.get("d2", 0)
+    gap2 = s.get("gap2", 0)
+    d3 = s.get("d3", 0)
+    power = s.get("power", 100)
+
+    pre_en = 1 if s.get("preheat_enabled", False) else 0
+    pre_ms = s.get("preheat_duration", 20)
+    pre_pct = s.get("preheat_power", 30)
+    pre_gap = s.get("preheat_gap_ms", 3)
+
+    trigger_mode = str(s.get("trigger_mode", "pedal")).strip().lower()
+
+    try:
+        contact_hold_steps = int(s.get("contact_hold_steps", 2))
+    except Exception:
+        contact_hold_steps = 2
+
+    if contact_hold_steps < 1:
+        contact_hold_steps = 1
+    if contact_hold_steps > 10:
+        contact_hold_steps = 10
+
+    # ESP protocol:
+    # 1 = pedal
+    # 2 = contact
+    trigger_mode_num = 2 if trigger_mode == "contact" else 1
+
+    cmd_pulse   = f"SET_PULSE,{mode},{d1},{gap1},{d2},{gap2},{d3}"
+    cmd_power   = f"SET_POWER,{power}"
+    cmd_pre     = f"SET_PREHEAT,{pre_en},{pre_ms},{pre_pct},{pre_gap}"
+    cmd_trigger = f"SET_TRIGGER_MODE,{trigger_mode_num}"
+    cmd_contact = f"SET_CONTACT_HOLD,{contact_hold_steps}"
+
+    log(f"{log_prefix}➡️ Syncing settings to ESP: {cmd_pulse}")
+    esp_link.send_command(cmd_pulse)
+
+    log(f"{log_prefix}➡️ Syncing power to ESP: {cmd_power}")
+    esp_link.send_command(cmd_power)
+
+    log(f"{log_prefix}➡️ Syncing preheat to ESP: {cmd_pre}")
+    esp_link.send_command(cmd_pre)
+
+    log(f"{log_prefix}➡️ Syncing trigger mode to ESP: {cmd_trigger}")
+    esp_link.send_command(cmd_trigger)
+
+    log(f"{log_prefix}➡️ Syncing contact hold to ESP: {cmd_contact}")
+    esp_link.send_command(cmd_contact)
+
+
 # ========== ESP32 TCP LINK ==========
 class ESP32Link:
-    """Manages TCP connection to ESP32"""
-
-    def __init__(self, host, port):
+    def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
-        self.sock = None
+        self.sock: socket.socket | None = None
         self.connected = False
         self.running = True
-        self.rx_thread = None
 
-    def connect(self):
-        """Establish TCP connection"""
+        self.connected_at = 0.0
+        self.last_rx = 0.0
+
+        # Last pack voltage value that was allowed through deadband filtering.
+        self.last_vpack_emitted: float | None = None
+
+        self._hb_greenlet = None
+        self._rx_greenlet = None
+
+    def connect(self) -> bool:
         try:
             self.running = True
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(5.0)  # connect timeout
-            self.sock.connect((self.host, self.port))
 
-            # After connect, use short recv timeout so the RX thread can keep looping
-            self.sock.settimeout(1.0)
+            self.sock = socket.create_connection((self.host, self.port), timeout=CONNECT_TIMEOUT_S)
+            self.sock.settimeout(RECV_TIMEOUT_S)
+
+            # Keepalive (best-effort)
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                if hasattr(socket, "TCP_KEEPIDLE"):
+                    self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 5)
+                if hasattr(socket, "TCP_KEEPINTVL"):
+                    self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
+                if hasattr(socket, "TCP_KEEPCNT"):
+                    self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 2)
+            except Exception as e:
+                log(f"⚠️ Keepalive not applied (non-fatal): {e}")
 
             self.connected = True
+            self.connected_at = time.time()
+            self.last_rx = time.time()
+
+            # Reset deadband state on fresh connection so first STATUS2 sample emits.
+            self.last_vpack_emitted = None
+
             log(f"✅ Connected to ESP32 at {self.host}:{self.port}")
 
-            # Start receive thread
-            self.rx_thread = threading.Thread(target=self._receive_loop, daemon=True)
-            self.rx_thread.start()
+            # Start RX loop
+            self._rx_greenlet = eventlet.spawn_n(self._receive_loop)
+
+            # Heartbeat loop optional (disabled)
+            # self._hb_greenlet = eventlet.spawn_n(self._heartbeat_loop)
+
+            # One-time snapshot request
+            self.send_command("STATUS", log_send=False)
+            if REQUEST_CELLS_ON_CONNECT:
+                self.send_command("CELLS", log_send=False)
 
             return True
+
         except Exception as e:
             log(f"❌ Failed to connect to ESP32: {e}")
             self.connected = False
-            try:
-                if self.sock:
-                    self.sock.close()
-            except Exception:
-                pass
-            self.sock = None
+            self._close_sock()
             return False
 
-    def disconnect(self):
-        """Close TCP connection"""
-        self.running = False
-        self.connected = False
+    def _close_sock(self) -> None:
         if self.sock:
-            try:
-                self.sock.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
             try:
                 self.sock.close()
             except Exception:
                 pass
-            self.sock = None
-        log("🔌 Disconnected from ESP32")
+        self.sock = None
 
-    def send_command(self, cmd):
-        """Send command to ESP32"""
+    def disconnect(self) -> None:
+        was_connected = self.connected
+
+        self.running = False
+        self.connected = False
+
+        # Kill greenlets so we never have two loops alive
+        try:
+            if self._rx_greenlet is not None:
+                eventlet.kill(self._rx_greenlet)
+        except Exception:
+            pass
+        try:
+            if self._hb_greenlet is not None:
+                eventlet.kill(self._hb_greenlet)
+        except Exception:
+            pass
+
+        self._rx_greenlet = None
+        self._hb_greenlet = None
+
+        self._close_sock()
+
+        if was_connected:
+            log("🔌 Disconnected from ESP32")
+
+    def send_command(self, cmd: str, log_send: bool = True) -> bool:
         if not self.connected or not self.sock:
-            log(f"⚠️ Cannot send command (not connected): {cmd}")
+            if log_send:
+                log(f"⚠️ Cannot send command (not connected): {cmd}")
             return False
 
         try:
             if not cmd.endswith("\n"):
                 cmd += "\n"
             self.sock.sendall(cmd.encode("utf-8"))
-            log(f"📤 Sent: {cmd.strip()}")
+            if log_send:
+                log(f"📤 Sent: {cmd.strip()}")
             return True
         except Exception as e:
-            log(f"❌ Failed to send command: {e}")
+            if log_send:
+                log(f"❌ Failed to send command: {e}")
             self.disconnect()
             return False
 
-    def _receive_loop(self):
-        """Background thread to receive data from ESP32"""
-        global esp_connected, last_status
+    def _heartbeat_loop(self) -> None:
+        while self.running and self.connected:
+            eventlet.sleep(HEARTBEAT_INTERVAL_S)
+            if self.connected:
+                self.send_command("PING", log_send=False)
+
+    def _receive_loop(self) -> None:
+        global esp_connected
 
         buffer = ""
-        last_rx = time.time()  # watchdog timer
-        # Keepalive strategy:
-        # - Do NOT disconnect just because telemetry pauses briefly.
-        # - But DO force reconnect if we see nothing for too long (ESP reboot / half-dead socket).
+
         while self.running and self.connected:
             try:
-                data = self.sock.recv(1024)
-
+                data = self.sock.recv(1024)  # type: ignore[union-attr]
                 if not data:
                     log("⚠️ ESP32 connection closed (recv returned empty)")
                     break
 
-                last_rx = time.time()
-
+                self.last_rx = time.time()
                 buffer += data.decode("utf-8", errors="ignore")
 
                 while "\n" in buffer:
@@ -147,54 +433,116 @@ class ESP32Link:
                         self._handle_line(line)
 
             except socket.timeout:
-                # Watchdog: if silent too long, force reconnect
-                if time.time() - last_rx > 30:
-                    log("⚠️ No telemetry for 30s; forcing reconnect")
+                now = time.time()
+
+                if (now - self.connected_at) < NO_TELEM_GRACE_S:
+                    continue
+
+                if (now - self.last_rx) > NO_TELEM_RECONNECT_S:
+                    log(f"⚠️ No telemetry for {NO_TELEM_RECONNECT_S:.0f}s; forcing reconnect")
                     break
-                continue
+
             except Exception as e:
                 log(f"❌ Receive error: {e}")
                 break
 
-        # Clean up when loop exits
         log("🧹 Receive loop exiting, cleaning up connection...")
         self.disconnect()
         esp_connected = False
-        socketio.emit("status_update", {"esp_connected": False})
+        emit_status_update({"esp_connected": False})
 
-    def _handle_line(self, line):
-        """Parse and handle incoming ESP32 data"""
-        global esp_connected, last_status
+    def _handle_line(self, line: str) -> None:
+        global esp_connected
+
+        # Drop noisy keepalives / spammy heartbeats
+        if line in ("TICK_1S", "PING", "PONG"):
+            return
 
         log(f"📥 Received: {line}")
 
-        # Update connection status (first good line received)
         if not esp_connected:
             esp_connected = True
-            socketio.emit("status_update", {"esp_connected": True})
+            emit_status_update({"esp_connected": True})
 
-        # Parse different message types (comma-separated format)
+        if line.startswith("STATUS,"):
+            self._parse_status(line[7:])
+    def _receive_loop(self) -> None:
+        global esp_connected
+
+        buffer = ""
+
+        while self.running and self.connected:
+            try:
+                data = self.sock.recv(1024)  # type: ignore[union-attr]
+                if not data:
+                    log("⚠️ ESP32 connection closed (recv returned empty)")
+                    break
+
+                self.last_rx = time.time()
+                buffer += data.decode("utf-8", errors="ignore")
+
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        self._handle_line(line)
+
+            except socket.timeout:
+                now = time.time()
+
+                if (now - self.connected_at) < NO_TELEM_GRACE_S:
+                    continue
+
+                if (now - self.last_rx) > NO_TELEM_RECONNECT_S:
+                    log(f"⚠️ No telemetry for {NO_TELEM_RECONNECT_S:.0f}s; forcing reconnect")
+                    break
+
+            except Exception as e:
+                log(f"❌ Receive error: {e}")
+                break
+
+        log("🧹 Receive loop exiting, cleaning up connection...")
+        self.disconnect()
+        esp_connected = False
+        emit_status_update({"esp_connected": False})
+
+    def _handle_line(self, line: str) -> None:
+        global esp_connected
+
+        # Drop noisy keepalives / spammy heartbeats
+        if line in ("TICK_1S", "PING", "PONG"):
+            return
+
+        log(f"📥 Received: {line}")
+
+        if not esp_connected:
+            esp_connected = True
+            emit_status_update({"esp_connected": True})
+
         if line.startswith("STATUS,"):
             self._parse_status(line[7:])
         elif line.startswith("CELLS,"):
             self._parse_cells(line[6:])
-        elif line.startswith("WELD:") or line.startswith("WELD,"):
-            socketio.emit(
-                "weld_event",
-                {"message": line.split(",", 1)[1] if "," in line else line},
-            )
-        elif line.startswith("PEDAL:") or line.startswith("PEDAL,"):
-            active = "pressed" in line.lower()
-            socketio.emit("pedal_active", {"active": active})
+        elif line.startswith("STATUS2,"):
+            self._parse_status2(line[8:])
+        elif line.startswith("EVENT,"):
+            self._parse_event(line[6:])
+        elif line.startswith("DENY,"):
+            reason = line[5:]
+            log(f"🚫 DENY: {reason}")
+            socketio.emit("deny_event", {"reason": reason})
+        elif line.startswith("BOOT,"):
+            msg = line[5:]
+            log(f"🔄 STM32 BOOT: {msg}")
+            socketio.emit("boot_event", {"message": msg})
         elif line.startswith("CHARGER:") or line.startswith("CHARGER,"):
             payload = line.split(",", 1)[1] if "," in line else line.split(":", 1)[1]
             self._parse_charger(payload)
         else:
             socketio.emit("esp32_message", {"message": line})
 
-    def _parse_status(self, data):
-        """Parse STATUS line"""
-        global last_status, current_settings
+    def _parse_status(self, data: str) -> None:
+        global last_status
         try:
             status = {}
             for pair in data.split(","):
@@ -210,37 +558,13 @@ class ESP32Link:
                     except Exception:
                         status[key] = val
 
-            # Aliases
-            if "temp" in status:
-                status["temperature"] = status["temp"]
-            if "i" in status:
-                status["current"] = status["i"]
-
             last_status.update(status)
-            status["esp_connected"] = True
-            status.update(
-                {
-                    "mode": current_settings.get("mode", 1),
-                    "d1": current_settings.get("d1", 50),
-                    "gap1": current_settings.get("gap1", 0),
-                    "d2": current_settings.get("d2", 0),
-                    "gap2": current_settings.get("gap2", 0),
-                    "d3": current_settings.get("d3", 0),
-                    "power_pct": current_settings.get("power", 100),
-                    "preheat_en": current_settings.get("preheat_enabled", False),
-                    "preheat_ms": current_settings.get("preheat_duration", 20),
-                    "preheat_pct": current_settings.get("preheat_power", 30),
-                    "preheat_gap_ms": current_settings.get("preheat_gap_ms", 3),
-                }
-            )
-            socketio.emit("status_update", status)
-            socketio.emit("esp32_status", status)
+            emit_status_update({})
 
         except Exception as e:
             log(f"⚠️ Failed to parse STATUS: {e}")
 
-    def _parse_cells(self, data):
-        """Parse CELLS line"""
+    def _parse_cells(self, data: str) -> None:
         global last_status
         try:
             cells = {}
@@ -249,305 +573,243 @@ class ESP32Link:
                     key, val = pair.split("=", 1)
                     key = key.strip()
                     val = val.strip()
-                    # keep both Cx and Vx fields if present
                     try:
                         cells[key] = float(val)
                     except Exception:
                         pass
 
             last_status.update(cells)
-            socketio.emit("status_update", cells)
+            emit_status_update({})
 
         except Exception as e:
             log(f"⚠️ Failed to parse CELLS: {e}")
 
-    def _parse_charger(self, data):
-        """Parse CHARGER line"""
+    def _parse_charger(self, data: str) -> None:
         global last_status
         try:
             if "current=" in data:
                 val = data.split("current=")[1].split("A")[0].strip()
                 current = float(val)
                 last_status["current"] = current
-                socketio.emit("esp32_status", {"current": current, "i": current})
+                last_status["i"] = current
+                emit_status_update({})
         except Exception as e:
             log(f"⚠️ Failed to parse CHARGER: {e}")
 
-
-# ========== SETTINGS MANAGEMENT ==========
-def load_settings():
-    """Load settings from JSON file"""
-    if os.path.exists(SETTINGS_FILE):
+    def _parse_status2(self, data: str) -> None:
+        global last_status
         try:
-            with open(SETTINGS_FILE, "r") as f:
-                return json.load(f)
+            cells = {}
+            for pair in data.split(","):
+                if "=" in pair:
+                    key, val = pair.split("=", 1)
+                    key = key.strip()
+                    val = val.strip()
+                    try:
+                        cells[key] = float(val)
+                    except Exception:
+                        cells[key] = val
+
+            # Suppress tiny phantom charger-current noise from INA226 telemetry.
+            # Keep this narrow so real charging current still shows up promptly.
+            for charge_key in ("charge_a", "ichg"):
+                if charge_key in cells:
+                    try:
+                        charge_current = float(cells[charge_key])
+                        if abs(charge_current) < STATUS2_CHARGE_NOISE_THRESHOLD_A:
+                            cells[charge_key] = 0.0
+                    except Exception:
+                        # Non-numeric value; leave untouched.
+                        pass
+
+            # Deadband filter for pack-voltage display smoothing.
+            # Keep STATUS2 update cadence unchanged; only clamp tiny vpack moves.
+            if "vpack" in cells:
+                try:
+                    new_vpack = float(cells["vpack"])
+
+                    if self.last_vpack_emitted is None:
+                        # First sample always passes through.
+                        self.last_vpack_emitted = new_vpack
+                    elif abs(new_vpack - self.last_vpack_emitted) <= STATUS2_VPACK_DEADBAND_V:
+                        # Within deadband: hold last emitted value to suppress twitching.
+                        cells["vpack"] = self.last_vpack_emitted
+                    else:
+                        # Meaningful voltage movement: allow update.
+                        self.last_vpack_emitted = new_vpack
+                except Exception:
+                    # Non-numeric value; leave untouched.
+                    pass
+
+            last_status.update(cells)
+            emit_status_update({})
+
         except Exception as e:
-            log(f"⚠️ Failed to load settings: {e}")
+            log(f"⚠️ Failed to parse STATUS2: {e}")
 
-    # Default settings
-    return {
-        "mode": 1,
-        "d1": 50,
-        "gap1": 0,
-        "d2": 0,
-        "gap2": 0,
-        "d3": 0,
-        "power": 100,
-        "preheat_enabled": False,
-        "preheat_duration": 20,
-        "preheat_power": 30,
-        "preheat_gap_ms": 3,
-        "active_preset": None,
-    }
+    def _parse_event(self, event: str) -> None:
+        if event == "WELD_START":
+            socketio.emit("weld_event", {"message": "WELD_START", "active": True})
 
+        elif event.startswith("WELD_DONE,"):
+            try:
+                parsed = {}
+                for pair in event[10:].split(","):
+                    if "=" in pair:
+                        k, v = pair.split("=", 1)
+                        k = k.strip()
+                        v = v.strip()
+                        try:
+                            parsed[k] = float(v) if "." in v else int(v)
+                        except Exception:
+                            parsed[k] = v
 
-def save_settings(settings):
-    """Save settings to JSON file"""
-    try:
-        with open(SETTINGS_FILE, "w") as f:
-            json.dump(settings, f, indent=2)
-        return True
-    except Exception as e:
-        log(f"⚠️ Failed to save settings: {e}")
-        return False
+                joules = ((float(parsed.get('vcap_b', 0)) + float(parsed.get('vcap_a', 0)))
+                          * float(parsed.get('avg_a', 0))
+                          * float(parsed.get('total_ms', 0)) / 2000.0)
 
+                socketio.emit("weld_complete", {
+                    'peak_current_amps': float(parsed.get('peak_a', 0)),
+                    'avg_current_amps': float(parsed.get('avg_a', 0)),
+                    'duration_ms': float(parsed.get('total_ms', 0)),
+                    'energy_joules': joules,
+                    'vcap_before': float(parsed.get('vcap_b', 0)),
+                    'vcap_after': float(parsed.get('vcap_a', 0)),
+                })
+                log(f"✅ WELD_DONE: {parsed.get('total_ms')}ms  peak={parsed.get('peak_a')}A  avg={parsed.get('avg_a')}A  ΔV={parsed.get('delta_v')}V")
+            except Exception as e:
+                log(f"⚠️ Failed to parse WELD_DONE: {e}")
 
-def load_presets():
-    """Load presets from JSON file"""
-    if os.path.exists(PRESETS_FILE):
-        try:
-            with open(PRESETS_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            log(f"⚠️ Failed to load presets: {e}")
+        elif event == "PEDAL_PRESS":
+            socketio.emit("pedal_active", {"active": True})
 
-    # Default presets (kept as-is, though your original had some misplaced braces)
-    return {
-        "P1": {
-            "name": "Preset 1",
-            "mode": 1,
-            "d1": 50,
-            "gap1": 0,
-            "d2": 0,
-            "gap2": 0,
-            "d3": 0,
-            "power": 100,
-            "preheat_enabled": False,
-            "preheat_duration": 20,
-            "preheat_power": 30,
-            "preheat_gap_ms": 3,
-        },
-        "P2": {
-            "name": "Preset 2",
-            "mode": 1,
-            "d1": 80,
-            "gap1": 0,
-            "d2": 0,
-            "gap2": 0,
-            "d3": 0,
-            "power": 100,
-            "preheat_enabled": False,
-            "preheat_duration": 20,
-            "preheat_power": 30,
-            "preheat_gap_ms": 3,
-        },
-        "P3": {
-            "name": "Preset 3",
-            "mode": 2,
-            "d1": 50,
-            "gap1": 10,
-            "d2": 50,
-            "gap2": 0,
-            "d3": 0,
-            "power": 100,
-            "preheat_enabled": False,
-            "preheat_duration": 20,
-            "preheat_power": 30,
-            "preheat_gap_ms": 3,
-        },
-        "P4": {
-            "name": "Preset 4",
-            "mode": 1,
-            "d1": 100,
-            "gap1": 0,
-            "d2": 0,
-            "gap2": 0,
-            "d3": 0,
-            "power": 100,
-            "preheat_enabled": False,
-            "preheat_duration": 20,
-            "preheat_power": 30,
-            "preheat_gap_ms": 3,
-        },
-        "P5": {
-            "name": "Preset 5",
-            "mode": 3,
-            "d1": 40,
-            "gap1": 10,
-            "d2": 40,
-            "gap2": 10,
-            "d3": 40,
-            "power": 100,
-            "preheat_enabled": False,
-            "preheat_duration": 20,
-            "preheat_power": 30,
-            "preheat_gap_ms": 3,
-        },
-    }
+        else:
+            # CONTACT_TRIGGER, ARM_TIMEOUT, READY_TIMEOUT — pass through raw
+            socketio.emit("esp32_message", {"message": f"EVENT,{event}"})
 
 
-def save_presets(presets):
-    """Save presets to JSON file"""
-    try:
-        with open(PRESETS_FILE, "w") as f:
-            json.dump(presets, f, indent=2)
-        return True
-    except Exception as e:
-        log(f"⚠️ Failed to save presets: {e}")
-        return False
-
-
-# ========== WEB ROUTES ==========
+# ==== WEB ROUTES ====
 @app.route("/")
 def index():
-    """Redirect to control page"""
     return render_template("control.html")
 
 
 @app.route("/control")
 def control():
-    """Main control page"""
     return render_template("control.html")
 
 
 @app.route("/logs")
 def logs():
-    """Logs page"""
     try:
         with open(LOG_FILE, "r") as f:
-            log_lines = f.readlines()[-100:]  # Last 100 lines
+            log_lines = f.readlines()[-100:]
         return render_template("logs.html", logs=log_lines)
     except Exception:
         return render_template("logs.html", logs=[])
 
 
-# ========== API ROUTES ==========
 @app.route("/api/status")
 def api_status():
-    """Get current status"""
-    global esp_connected, last_status
-    return jsonify(
-        {"status": "ok", "esp_connected": esp_connected, "data": last_status}
-    )
+    return jsonify({"status": "ok", "esp_connected": esp_connected, "data": last_status})
 
 
 @app.route("/api/get_settings")
 def api_get_settings():
-    """Get current settings"""
     settings = load_settings()
     return jsonify({"status": "ok", "settings": settings})
 
 
 @app.route("/api/save_settings", methods=["POST"])
 def api_save_settings():
-    """Save settings and send to ESP32"""
-    global esp_link, current_settings
+    global current_settings
 
     data = request.get_json()
     if not data:
         return jsonify({"status": "error", "message": "No data provided"}), 400
+
+    # Make sure new keys exist even if older UI doesn't send them
+    if "trigger_mode" not in data:
+        data["trigger_mode"] = "pedal"
+    if "contact_hold_steps" not in data:
+        data["contact_hold_steps"] = 2
 
     if not save_settings(data):
         return jsonify({"status": "error", "message": "Failed to save settings"}), 500
 
     current_settings = data
 
+    # Push immediately to ESP on save
     if esp_link and esp_link.connected:
-        try:
-            mode = data.get("mode", 1)
-            d1 = data.get("d1", 50)
-            gap1 = data.get("gap1", 0)
-            d2 = data.get("d2", 0)
-            gap2 = data.get("gap2", 0)
-            d3 = data.get("d3", 0)
-
-            cmd = f"SET_PULSE,{mode},{d1},{gap1},{d2},{gap2},{d3}"
-            log(f"⚡ Sending to ESP32 (TCP): {cmd}")
-            esp_link.send_command(cmd)
-        except Exception as e:
-            log(f"⚠️ Failed to send settings to ESP32: {e}")
+        push_settings_to_esp(log_prefix="[SAVE] ")
 
     return jsonify({"status": "ok"})
-
-
 @app.route("/api/set_power", methods=["POST"])
 def api_set_power():
-    """Set weld power percentage"""
-    global esp_link
-    data = request.get_json()
+    global current_settings
+    data = request.get_json() or {}
     power = data.get("power", 100)
 
-    if esp_link and esp_link.connected:
-        try:
-            cmd = f"SET_POWER,{power}"
-            log(f"⚡ Sending to ESP32 (TCP): {cmd}")
-            esp_link.send_command(cmd)
-            return jsonify({"status": "ok"})
-        except Exception as e:
-            log(f"⚠️ Failed to set power: {e}")
-            return jsonify({"status": "error", "message": str(e)}), 500
+    s = current_settings or load_settings()
+    s["power"] = power
+    current_settings = s
+    save_settings(s)
 
-    log("⚠️ ESP32 TCP link not initialized for SET_POWER")
+    if esp_link and esp_link.connected:
+        cmd = f"SET_POWER,{power}"
+        log(f"⚡ Sending to ESP32 (TCP): {cmd}")
+        ok = esp_link.send_command(cmd)
+        return jsonify({"status": "ok" if ok else "error"})
+
     return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
 
 
 @app.route("/api/set_preheat", methods=["POST"])
 def api_set_preheat():
-    """Set preheat configuration"""
-    global esp_link
-    data = request.get_json()
-    enabled = 1 if data.get("enabled", False) else 0
+    global current_settings
+    data = request.get_json() or {}
+
+    enabled = bool(data.get("enabled", False))
     duration = data.get("duration", 20)
     power = data.get("power", 30)
     gap_ms = data.get("gap_ms", 3)
 
-    if esp_link and esp_link.connected:
-        try:
-            cmd = f"SET_PREHEAT,{enabled},{duration},{power},{gap_ms}"
-            log(f"🔥 Sending to ESP32 (TCP): {cmd}")
-            esp_link.send_command(cmd)
-            return jsonify({"status": "ok"})
-        except Exception as e:
-            log(f"⚠️ Failed to set preheat: {e}")
-            return jsonify({"status": "error", "message": str(e)}), 500
+    s = current_settings or load_settings()
+    s["preheat_enabled"] = enabled
+    s["preheat_duration"] = duration
+    s["preheat_power"] = power
+    s["preheat_gap_ms"] = gap_ms
+    current_settings = s
+    save_settings(s)
 
-    log("⚠️ ESP32 TCP link not initialized for SET_PREHEAT")
+    if esp_link and esp_link.connected:
+        cmd = f"SET_PREHEAT,{1 if enabled else 0},{duration},{power},{gap_ms}"
+        log(f"🔥 Sending to ESP32 (TCP): {cmd}")
+        ok = esp_link.send_command(cmd)
+        return jsonify({"status": "ok" if ok else "error"})
+
     return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
 
 
 @app.route("/api/get_presets")
 def api_get_presets():
-    """Get all presets"""
     presets = load_presets()
     settings = load_settings()
-    return jsonify(
-        {
-            "status": "ok",
-            "presets": presets,
-            "active_preset": settings.get("active_preset"),
-        }
-    )
+    return jsonify({"status": "ok", "presets": presets, "active_preset": settings.get("active_preset")})
 
 
 @app.route("/api/save_preset", methods=["POST"])
 def api_save_preset():
-    """Save a preset"""
-    data = request.get_json()
+    data = request.get_json() or {}
     preset_id = data.get("preset_id")
     preset_data = data.get("data")
 
     if not preset_id or not preset_data:
         return jsonify({"status": "error", "message": "Missing preset_id or data"}), 400
+
+    # Force trigger settings OUT of presets if UI accidentally sends them
+    preset_data.pop("trigger_mode", None)
+    preset_data.pop("contact_hold_steps", None)
 
     presets = load_presets()
     presets[preset_id] = preset_data
@@ -560,28 +822,22 @@ def api_save_preset():
 
 @app.route("/api/arm", methods=["POST"])
 def api_arm():
-    """Arm the welder"""
-    global esp_link
     if esp_link and esp_link.connected:
-        esp_link.send_command("ARM")
+        esp_link.send_command("ARM,1")
         return jsonify({"status": "ok"})
     return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
 
 
 @app.route("/api/disarm", methods=["POST"])
 def api_disarm():
-    """Disarm the welder"""
-    global esp_link
     if esp_link and esp_link.connected:
-        esp_link.send_command("DISARM")
+        esp_link.send_command("ARM,0")
         return jsonify({"status": "ok"})
     return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
 
 
 @app.route("/api/fire", methods=["POST"])
 def api_fire():
-    """Manual fire"""
-    global esp_link
     if esp_link and esp_link.connected:
         esp_link.send_command("FIRE")
         return jsonify({"status": "ok"})
@@ -590,8 +846,6 @@ def api_fire():
 
 @app.route("/api/charge_on", methods=["POST"])
 def api_charge_on():
-    """Turn charging ON"""
-    global esp_link
     if esp_link and esp_link.connected:
         esp_link.send_command("CHARGE_ON")
         return jsonify({"status": "ok"})
@@ -600,43 +854,34 @@ def api_charge_on():
 
 @app.route("/api/charge_off", methods=["POST"])
 def api_charge_off():
-    """Turn charging OFF"""
-    global esp_link
     if esp_link and esp_link.connected:
         esp_link.send_command("CHARGE_OFF")
         return jsonify({"status": "ok"})
     return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
 
 
-# ========== SOCKETIO EVENTS ==========
 @socketio.on("connect")
 def handle_connect():
-    """Client connected"""
     log(f"🌐 Client connected: {request.sid}")
     emit("status_update", {**last_status, "esp_connected": esp_connected})
 
 
 @socketio.on("disconnect")
 def handle_disconnect():
-    """Client disconnected"""
     log(f"🌐 Client disconnected: {request.sid}")
 
 
-# ========== STARTUP ==========
 def init_esp32_connection():
-    """Initialize ESP32 connection in background"""
     global esp_link, esp_connected, current_settings
 
     current_settings = load_settings()
-
     log("🔌 Starting ESP32 connection manager...")
+
+    delay = RECONNECT_BASE_DELAY_S
 
     while True:
         try:
-            need_reconnect = (esp_link is None) or (not esp_link.connected)
-
-            if need_reconnect:
-                # IMPORTANT: tear down any previous link cleanly
+            if (esp_link is None) or (not esp_link.connected):
                 if esp_link is not None:
                     try:
                         esp_link.disconnect()
@@ -645,43 +890,38 @@ def init_esp32_connection():
                     esp_link = None
 
                 esp_connected = False
-                socketio.emit("status_update", {"esp_connected": False})
+                emit_status_update({"esp_connected": False})
 
                 esp_link = ESP32Link(ESP32_IP, ESP32_PORT)
 
                 if esp_link.connect():
-                    # Don't force esp_connected=True here.
-                    # We'll mark connected when we actually receive a STATUS/CELLS line.
-                    log("✅ TCP connected, waiting for telemetry...")
+                    esp_connected = True
+                    emit_status_update({"esp_connected": True})
+                    log("✅ TCP connected; syncing saved settings to ESP...")
+                    push_settings_to_esp(log_prefix="[ESP CONNECT] ")
+                    delay = RECONNECT_BASE_DELAY_S
                 else:
-                    log("❌ Connection failed, retrying in 5 seconds...")
-                    time.sleep(5)
+                    log(f"❌ Connection failed, retrying in {delay:.0f} seconds...")
+                    eventlet.sleep(delay)
+                    delay = min(RECONNECT_MAX_DELAY_S, delay * 2)
             else:
-                time.sleep(1)
+                eventlet.sleep(1)
 
         except Exception as e:
             log(f"❌ Connection manager error: {e}")
             esp_connected = False
-            socketio.emit("status_update", {"esp_connected": False})
-            time.sleep(5)
+            emit_status_update({"esp_connected": False})
+            eventlet.sleep(2)
 
 
-# ========== MAIN ==========
 if __name__ == "__main__":
+
     log("🚀 Starting Spot Welder Control Server")
     log(f"📡 ESP32 Target: {ESP32_IP}:{ESP32_PORT}")
 
-    # Start ESP32 connection thread
-    esp_thread = threading.Thread(target=init_esp32_connection, daemon=True)
-    esp_thread.start()
+    if not _esp_manager_started:
+        _esp_manager_started = True
+        eventlet.spawn_n(init_esp32_connection)
 
-    # Start Flask server
     log("🌐 Starting web server on http://0.0.0.0:8080")
-    socketio.run(
-        app,
-        host="0.0.0.0",
-        port=8080,
-        debug=False,
-        use_reloader=False,
-        allow_unsafe_werkzeug=True,
-    )
+    socketio.run(app, host="0.0.0.0", port=8080, debug=False, use_reloader=False)

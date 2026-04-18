@@ -5,7 +5,7 @@ import traceback
 
 
 class ESP32Link:
-    def __init__(self, host='192.168.68.56', port=8888,
+    def __init__(self, host='192.168.68.77', port=8888,
                  status_callback=None, weld_data_callback=None, fired_callback=None):
         self.host = host
         self.port = port
@@ -60,8 +60,11 @@ class ESP32Link:
         while self.running:
             try:
                 print(f"[ESP32Link] Connecting to {self.host}:{self.port}...")
-                self.sock = socket.create_connection((self.host, self.port), timeout=5.0)
-                self.sock.settimeout(1.0)
+                # Enable TCP keep-alives for fast reconnect detection
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 5)   # Start probing after 5s idle
+                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)  # Probe every 2s
+                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 2)    # Give up after 2 failed probes
                 self.connected = True
                 self.last_data_time = time.time()
                 print(f"[ESP32Link] ✓ Connected to {self.host}:{self.port}")

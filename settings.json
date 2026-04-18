@@ -1,0 +1,16 @@
+{
+  "mode": 1,
+  "d1": 10,
+  "gap1": 0,
+  "d2": 0,
+  "gap2": 0,
+  "d3": 0,
+  "active_preset": null,
+  "power": 100,
+  "preheat_enabled": false,
+  "preheat_duration": 20,
+  "preheat_power": 30,
+  "preheat_gap_ms": 3,
+  "trigger_mode": "pedal",
+  "contact_hold_steps": 2
+}
