@@ -1,38 +1,43 @@
-# Backup files
-*.backup
-*.backup.*
-*.backup_*
-
-# Python cache
+# ─── Python / Virtual Environment ───
+.venv/
+venv/
+env/
 __pycache__/
 *.pyc
 *.pyo
-
-# Weld history (runtime data)
-weld_history/*.json
-
-# Settings (contains runtime state)
-server/settings.json
-
-# Logs
+*.pyd
+*.egg-info/
+dist/
+build/
 *.log
-# Local scratch / experiments (ESP32 + server)
-esp32/%Run
-esp32/add_tcp_to_main.py
-esp32/add_wifi.py
-esp32/fix_tcp_globals.py
-esp32/main.py.broken
-esp32/main.py.current
-esp32/main_clean.py
-esp32/main_from_esp.py
-esp32/main_from_esp32.py
-esp32/main_with_tcp.py
-esp32/main_working.py
-esp32/tcp_from_esp.py
-esp32/tcp_server.py
-server/esp_link.py.broken_backup
-# Local ESP32 firmware backups / pulls
-esp32/*.pre_esp_pull_*
-esp32/*.pre_git_sync_*
-esp32/main_from_esp_live.py
-esp32/wifi_config_from_esp_live.py
+
+# ─── PlatformIO / STM32 Firmware ───
+.pio/
+.pioenvs/
+.piolibdeps/
+*.bin
+*.elf
+*.hex
+*.map
+*.lst
+
+# ─── VS Code ───
+.vscode/
+*.code-workspace
+
+# ─── OS Junk ───
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Backup / Temp Files ───
+*.bak
+*.tmp
+*.swp
+*.zip
+*.tar.gz
+
+# ─── Secrets / Config ───
+*.env
+secrets.py
+config_local.py
