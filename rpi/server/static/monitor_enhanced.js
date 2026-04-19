@@ -1,31 +1,32 @@
-// Initialize SocketIO connection
-const socket = io();
+// ============================================================
+// monitor_enhanced.js  —  Spot Welder Monitor
+// ============================================================
 
-// Global chart variable
+const socket = io();
 let waveformChart = null;
 
-// Connection status
+// ── Connection status ────────────────────────────────────────
 socket.on('connect', function () {
     console.log('SocketIO connected');
-    document.getElementById('connectionStatus').textContent = 'Connected';
-    document.getElementById('connectionStatus').className = 'connection-status connected';
+    const el = document.getElementById('connectionStatus');
+    if (el) { el.textContent = 'Connected'; el.className = 'connection-status connected'; }
 });
 
 socket.on('disconnect', function () {
     console.log('SocketIO disconnected');
-    document.getElementById('connectionStatus').textContent = 'Disconnected';
-    document.getElementById('connectionStatus').className = 'connection-status disconnected';
+    const el = document.getElementById('connectionStatus');
+    if (el) { el.textContent = 'Disconnected'; el.className = 'connection-status disconnected'; }
 });
 
-// Initialize Chart.js when page loads
+// ── Chart initialisation ─────────────────────────────────────
 document.addEventListener('DOMContentLoaded', function () {
-    console.log('Initializing waveform chart...');
-
     const ctx = document.getElementById('waveformChart');
-    if (!ctx) {
-        console.error('Canvas element not found!');
-        return;
-    }
+    if (!ctx) { console.error('Canvas #waveformChart not found'); return; }
+
+    // Orange gradient fill for the waveform
+    const gradient = ctx.getContext('2d').createLinearGradient(0, 0, 0, 340);
+    gradient.addColorStop(0, 'rgba(255, 107, 53, 0.45)');
+    gradient.addColorStop(1, 'rgba(255, 107, 53, 0.02)');
 
     waveformChart = new Chart(ctx, {
         type: 'line',
@@ -35,371 +36,131 @@ document.addEventListener('DOMContentLoaded', function () {
                 {
                     label: 'Current (A)',
                     data: [],
-                    borderColor: 'rgb(255, 99, 132)',
-                    backgroundColor: 'rgba(255, 99, 132, 0.1)',
-                    yAxisID: 'y-current',
-                    tension: 0.1,
-                    borderWidth: 2
-                },
-                {
-                    label: 'Voltage (V)',
-                    data: [],
-                    borderColor: 'rgb(54, 162, 235)',
-                    backgroundColor: 'rgba(54, 162, 235, 0.1)',
-                    yAxisID: 'y-voltage',
-                    tension: 0.1,
-                    borderWidth: 2
+                    borderColor: '#ff6b35',
+                    backgroundColor: gradient,
+                    fill: true,
+                    tension: 0.3,
+                    borderWidth: 2.5,
+                    pointRadius: 0
                 }
             ]
         },
         options: {
             responsive: true,
             maintainAspectRatio: false,
-            interaction: {
-                mode: 'index',
-                intersect: false,
-            },
+            animation: false,
+            interaction: { mode: 'index', intersect: false },
             plugins: {
-                legend: {
-                    display: true,
-                    position: 'top'
-                },
-                tooltip: {
-                    enabled: true
-                }
+                legend: { display: false },
+                tooltip: { enabled: true }
             },
             scales: {
                 x: {
                     type: 'linear',
-                    title: {
-                        display: true,
-                        text: 'Time (ms)'
-                    },
-                    ticks: {
-                        callback: function (value) {
-                            return Number(value).toFixed(2);
-                        }
-                    },
-                    grid: {
-                        color: 'rgba(0, 0, 0, 0.05)'
-                    }
+                    title: { display: true, text: 'Time (ms)', color: '#aaa' },
+                    ticks: { color: '#aaa', callback: v => Number(v).toFixed(2) },
+                    grid: { color: 'rgba(255,255,255,0.05)' }
                 },
-                'y-current': {
+                y: {
                     type: 'linear',
-                    display: true,
                     position: 'left',
-                    title: {
-                        display: true,
-                        text: 'Current (A)'
-                    },
-                    grid: {
-                        color: 'rgba(255, 99, 132, 0.1)'
-                    }
-                },
-                'y-voltage': {
-                    type: 'linear',
-                    display: true,
-                    position: 'right',
-                    title: {
-                        display: true,
-                        text: 'Voltage (V)'
-                    },
-                    grid: {
-                        drawOnChartArea: false,
-                    }
+                    min: 0,
+                    max: 2000,
+                    title: { display: true, text: 'Current (A)', color: '#ff6b35' },
+                    ticks: { color: '#ff6b35' },
+                    grid: { color: 'rgba(255, 107, 53, 0.08)' }
                 }
             }
         }
     });
 
-    console.log('Waveform chart initialized successfully');
+    console.log('Waveform chart initialised');
 });
 
-// Listen for weld complete events
+// ── Helper: safe set element text ────────────────────────────
+function setText(id, val, decimals) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = (val !== undefined && val !== null && !isNaN(parseFloat(val)))
+        ? parseFloat(val).toFixed(decimals)
+        : '--';
+}
+
+// ── Weld complete ─────────────────────────────────────────────
 socket.on('weld_complete', function (data) {
-    console.log('Weld complete:', data);
+    console.log('weld_complete:', data);
 
-    // Update stats
-    document.getElementById('peakCurrent').textContent = data.peak_current_amps?.toFixed(2) || '--';
-    document.getElementById('avgCurrent').textContent = data.avg_current_amps?.toFixed(2) || '--';
-    document.getElementById('energy').textContent = data.energy_joules?.toFixed(2) || '--';
-    document.getElementById('duration').textContent = data.duration_ms?.toFixed(1) || '--';
-
-    const vDrop = (data.vcap_before - data.vcap_after)?.toFixed(2) || '--';
-    document.getElementById('voltageDrop').textContent = vDrop;
-
-    // Update last weld time
-    const now = new Date();
-    document.getElementById('lastWeldTime').textContent = now.toLocaleTimeString();
-});
-
-// Listen for waveform data
-socket.on('waveform_data', function (data) {
-    console.log('Waveform data received:', data.count, 'samples');
-
-    if (!waveformChart) {
-        console.error('Chart not initialized!');
-        return;
-    }
-
-    updateWaveformChart(data.samples);
-});
-
-// Update waveform chart
-function updateWaveformChart(samples) {
-    if (!samples || samples.length === 0) {
-        console.warn('No samples to display');
-        return;
-    }
-
-    console.log('Updating chart with', samples.length, 'samples');
-
-    // Build points using backend time_ms (fallback to index when missing)
-    const currentPoints = samples.map((sample, index) => {
-        const timeMs = Number.isFinite(Number(sample.time_ms)) ? Number(sample.time_ms) : index;
-        return {
-            x: timeMs,
-            y: Number(sample.current) || 0
-        };
-    });
-
-    const voltagePoints = samples.map((sample, index) => {
-        const timeMs = Number.isFinite(Number(sample.time_ms)) ? Number(sample.time_ms) : index;
-        return {
-            x: timeMs,
-            y: Number(sample.voltage) || 0
-        };
-    });
-
-    // Keep x-axis tightly fit to received waveform range
-    const minTime = currentPoints[0].x;
-    const maxTime = currentPoints[currentPoints.length - 1].x;
-    waveformChart.options.scales.x.min = minTime;
-    waveformChart.options.scales.x.max = maxTime;
-
-    // Update chart
-    waveformChart.data.labels = [];
-    waveformChart.data.datasets[0].data = currentPoints;
-    waveformChart.data.datasets[1].data = voltagePoints;
-    waveformChart.update();
-
-    const currentValues = currentPoints.map(point => point.y);
-    const voltageValues = voltagePoints.map(point => point.y);
-
-    console.log('Chart updated successfully');
-    console.log('Time range:', minTime.toFixed(2), '-', maxTime.toFixed(2), 'ms');
-    console.log('Current range:', Math.min(...currentValues).toFixed(2), '-', Math.max(...currentValues).toFixed(2), 'A');
-    console.log('Voltage range:', Math.min(...voltageValues).toFixed(2), '-', Math.max(...voltageValues).toFixed(2), 'V');
-}
-['cell1', 'cell2', 'cell3'].forEach(function (key) {
-    if (data[key] !== undefined) {
-        const el = document.getElementById(key);
-        if (el) el.textContent = parseFloat(data[key]).toFixed(3) + ' V';
-    }
-});
-
-// Temperature
-if (data.temp !== undefined) {
-    const el = document.getElementById('temp');
-    if (el) el.textContent = parseFloat(data.temp).toFixed(1) + ' °C';
-}
-
-// Charge current
-if (data.ichg !== undefined) {
-    const el = document.getElementById('ichg');
-    if (el) el.textContent = parseFloat(data.ichg).toFixed(2) + ' A';
-}
-
-// Armed / ready state
-if (data.armed !== undefined) {
-    const el = document.getElementById('armedStatus');
-    if (el) el.textContent = data.armed ? 'ARMED' : 'DISARMED';
-}
-
-// Weld count
-if (data.weld_count !== undefined) {
-    const el = document.getElementById('weldCount');
-    if (el) el.textContent = data.weld_count;
-}
-
-// ESP connection badge
-const connEl = document.getElementById('connectionStatus');
-if (connEl && data.esp_connected !== undefined) {
-    connEl.textContent = data.esp_connected ? 'Connected' : 'Disconnected';
-    connEl.className = 'connection-status ' + (data.esp_connected ? 'connected' : 'disconnected');
-};
-
-// Weld complete — uses fields from Python's weld_payload dict
-socket.on('weld_complete', function (data) {
-    console.log('Weld complete:', data);
-
-    // Python emits: peak_current_amps, avg_current_amps, duration_ms,
-    //               energy_joules (use energy_j from STM32 if present),
-    //               vcap_before, vcap_after, voltage_drop
-
-    const peakA = data.peak_current_amps;
-    const avgA = data.avg_current_amps;
-    const durMs = data.duration_ms;
-    // Prefer backend-corrected energy_joules, fallback to raw energy_j if needed
     const energyJ = data.energy_joules !== undefined ? data.energy_joules : data.energy_j;
     const vDrop = data.voltage_drop !== undefined
         ? data.voltage_drop
         : (data.vcap_before - data.vcap_after);
 
-    const set = function (id, val, decimals) {
-        const el = document.getElementById(id);
-        if (el) el.textContent = val !== undefined && val !== null
-            ? parseFloat(val).toFixed(decimals)
-            : '--';
-    };
+    setText('peakCurrent', data.peak_current_amps, 1);
+    setText('avgCurrent', data.avg_current_amps, 1);
+    setText('energy', energyJ, 2);
+    setText('duration', data.duration_ms, 1);
+    setText('voltageDrop', vDrop, 3);
 
-    set('peakCurrent', peakA, 1);
-    set('avgCurrent', avgA, 1);
-    set('energy', energyJ, 2);
-    set('duration', durMs, 1);
-    set('voltageDrop', vDrop, 3);
+    setText('vcapBefore', data.vcap_before, 3);
+    setText('vcapAfter', data.vcap_after, 3);
+    setText('vcapDrop', vDrop, 3);
 
-    // Vcap before/after/drop row
-    const vcapB = data.vcap_before;
-    const vcapA = data.vcap_after;
-    const vcapDrop = vDrop;
-
-    set('vcapBefore', vcapB, 3);
-    set('vcapAfter', vcapA, 3);
-    set('vcapDrop', vcapDrop, 3);
-
-    // Animate the drop bar (drop as % of before voltage, capped at 100%)
-    if (vcapB !== undefined && vcapB > 0 && vcapDrop !== undefined) {
-        const pct = Math.min((vcapDrop / vcapB) * 100 * 8, 100); // ×8 to exaggerate small drops visually
+    // Animate drop bar (×8 to make small drops visible)
+    if (data.vcap_before > 0 && vDrop !== undefined) {
+        const pct = Math.min((vDrop / data.vcap_before) * 100 * 8, 100);
         const bar = document.getElementById('vcapBar');
         if (bar) bar.style.width = pct.toFixed(1) + '%';
     }
 
-    // Tip voltage if forwarded
-    if (data.v_tips !== undefined) {
-        set('vTips', data.v_tips, 3);
-    }
-
-    // Last weld timestamp
-    const now = new Date();
-    const el = document.getElementById('lastWeldTime');
-    if (el) el.textContent = now.toLocaleTimeString();
+    const timeEl = document.getElementById('lastWeldTime');
+    if (timeEl) timeEl.textContent = new Date().toLocaleTimeString();
 });
 
-// Weld start flash
+// ── Weld start flash ──────────────────────────────────────────
 socket.on('weld_event', function (data) {
-    if (data.active) {
-        console.log('Weld started');
-        const el = document.getElementById('weldStatus');
-        if (el) {
-            el.textContent = 'WELDING';
-            el.className = 'weld-status welding';
-            setTimeout(function () {
-                el.textContent = 'IDLE';
-                el.className = 'weld-status idle';
-            }, 600);
-        }
-    }
+    if (!data.active) return;
+    const el = document.getElementById('weldStatus');
+    if (!el) return;
+    el.textContent = 'WELDING';
+    el.className = 'weld-status welding';
+    setTimeout(function () {
+        el.textContent = 'IDLE';
+        el.className = 'weld-status idle';
+    }, 600);
 });
 
-// Waveform data — backend emits {samples: [{voltage, current, time_ms}], count: N}
+// ── Waveform data ─────────────────────────────────────────────
 socket.on('waveform_data', function (data) {
-    console.log('\n' + '='.repeat(60));
-    console.log('WAVEFORM DEBUG - FRONTEND');
-    console.log('='.repeat(60));
+    const samples = Array.isArray(data && data.samples) ? data.samples : [];
+    console.log('waveform_data: ' + samples.length + ' samples');
 
-    const samples = Array.isArray(data?.samples) ? data.samples : [];
-    console.log('Received waveform data:', data);
-    console.log('Sample count:', samples.length);
+    if (!waveformChart) { console.error('Chart not ready'); return; }
+    if (samples.length === 0) { console.warn('Empty waveform payload'); return; }
 
-    if (!waveformChart) {
-        console.error('❌ Chart not initialized!');
-        console.log('='.repeat(60) + '\n');
-        return;
-    }
+    const currentPts = [];
 
-    if (samples.length > 0) {
-        const currents = samples.map(s => Number(s.current)).filter(Number.isFinite);
-        const times = samples.map(s => Number(s.time_ms)).filter(Number.isFinite);
-
-        console.log('\nFirst 3 samples:');
-        for (let i = 0; i < Math.min(3, samples.length); i++) {
-            console.log(`  Sample ${i}:`, samples[i]);
-        }
-
-        if (currents.length > 0 && times.length > 0) {
-            const minCurrent = Math.min(...currents);
-            const maxCurrent = Math.max(...currents);
-            const minTime = Math.min(...times);
-            const maxTime = Math.max(...times);
-
-            console.log('\nData ranges:');
-            console.log('  Time:', minTime.toFixed(2), '-', maxTime.toFixed(2), 'ms');
-            console.log('  Current:', minCurrent.toFixed(1), '-', maxCurrent.toFixed(1), 'A');
-            console.log('  Variation:', (maxCurrent - minCurrent).toFixed(1), 'A');
-
-            const variation = maxCurrent - minCurrent;
-            if (variation < 10) {
-                console.warn('⚠️  WARNING: Waveform appears FLAT (variation < 10 A)');
-            } else {
-                console.log('✅ Waveform has good variation');
-            }
-        }
-
-        const currentData = samples
-            .map(sample => ({
-                x: Number(sample.time_ms),
-                y: Number(sample.current)
-            }))
-            .filter(point => Number.isFinite(point.x) && Number.isFinite(point.y));
-
-        console.log('\nChart data points:', currentData.length);
-        if (currentData.length > 0) {
-            console.log('First chart point:', currentData[0]);
-            console.log('Last chart point:', currentData[currentData.length - 1]);
-
-            waveformChart.data.datasets[0].data = currentData;
-            waveformChart.update('active');
-            console.log('\n✅ Chart updated');
-        } else {
-            console.error('❌ No valid chart points after parsing!');
-        }
-    } else {
-        console.error('❌ No samples in waveform data!');
-    }
-
-    console.log('='.repeat(60) + '\n');
-});
-
-// Update waveform chart — current vs time
-function updateWaveformChart(samples) {
-    if (!samples || samples.length === 0) {
-        console.warn('No samples to display');
-        return;
-    }
-
-    console.log('Updating chart with', samples.length, 'samples');
-
-    const currentData = samples.map(function (sample, i) {
-        const timeMs = sample.time_ms !== undefined ? Number(sample.time_ms) : (i * 0.2);
-        const currentA = Number(sample.current);
-        return { x: timeMs, y: currentA };
-    }).filter(function (point) {
-        return Number.isFinite(point.x) && Number.isFinite(point.y);
+    samples.forEach(function (s, i) {
+        const t = Number.isFinite(Number(s.time_ms)) ? Number(s.time_ms) : i * 0.2;
+        const c = Number(s.current);
+        if (Number.isFinite(c)) currentPts.push({ x: t, y: c });
     });
 
-    if (currentData.length === 0) {
-        console.warn('No valid waveform points after parsing');
-        return;
-    }
+    if (currentPts.length === 0) { console.warn('No valid current points'); return; }
 
-    const currents = currentData.map(function (d) { return d.y; });
-    const minCurrent = Math.min(...currents);
-    const maxCurrent = Math.max(...currents);
-    console.log('Current range:', minCurrent, 'to', maxCurrent, 'A');
+    const minT = currentPts[0].x;
+    const maxT = currentPts[currentPts.length - 1].x;
+    waveformChart.options.scales.x.min = minT;
+    waveformChart.options.scales.x.max = maxT;
 
-    waveformChart.data.datasets[0].data = currentData;
+    // Auto-scale Y to peak with 10% headroom
+    const peakA = Math.max(...currentPts.map(p => p.y));
+    waveformChart.options.scales.y.max = Math.max(2000, Math.ceil(peakA * 1.1 / 100) * 100);
+
+    waveformChart.data.labels = [];
+    waveformChart.data.datasets[0].data = currentPts;
     waveformChart.update('active');
 
-    console.log('Chart updated');
-}
+    const currents = currentPts.map(p => p.y);
+    console.log('Chart updated | time ' + minT.toFixed(2) + '–' + maxT.toFixed(2) +
+        ' ms | current ' + Math.min(...currents).toFixed(0) + '–' + Math.max(...currents).toFixed(0) + ' A');
+});
