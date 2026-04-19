@@ -760,11 +760,19 @@ class ESP32Link:
                 vcap_a = float(parsed.get("vcap_a", 0.0))
                 avg_a = float(parsed.get("avg_a", 0.0))
                 total_ms = float(parsed.get("total_ms", 0.0))
+                v_tips = float(parsed.get("v_tips", 0.0))
                 last_weld_duration_ms = total_ms
 
-                # NOTE: This uses capacitor/pack voltage (vcap), not the true arc/weld voltage.
-                # The energy number is useful for relative trending, but not physically exact.
-                joules = ((vcap_b + vcap_a) * avg_a * total_ms / 2000.0)
+                # Prefer physically-correct weld energy using tip voltage.
+                # E = V * I * t, with t in seconds.
+                if v_tips > 0 and total_ms > 0:
+                    joules = v_tips * avg_a * (total_ms / 1000.0)
+                elif "energy_j" in parsed:
+                    # Fall back to STM32-provided energy if available.
+                    joules = float(parsed.get("energy_j", 0.0))
+                else:
+                    # Legacy fallback if older firmware does not provide v_tips/energy_j.
+                    joules = ((vcap_b + vcap_a) * avg_a * total_ms / 2000.0)
 
                 voltage_drop = float(parsed.get("delta_v", vcap_b - vcap_a))
 
