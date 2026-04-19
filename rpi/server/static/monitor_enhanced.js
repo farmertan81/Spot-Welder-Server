@@ -1,578 +1,378 @@
-// 🚀 FULL MONTY CHART ENHANCEMENTS
-
-// ==================== Annotation Plugin ====================
-
-const annotationPlugin = {
-    id: 'customAnnotations',
-    afterDatasetsDraw(chart) {
-        const ctx = chart.ctx;
-        const chartArea = chart.chartArea;
-        const datasets = chart.data.datasets;
-
-        if (!datasets || datasets.length === 0) return;
-        if (!datasets[0].data || datasets[0].data.length === 0) return;
-
-        const currentData = datasets[0].data;
-
-        // Calculate metrics using improved method
-        const peakCurrent = Math.max(...currentData.map(d => d.y));
-        const riseTimeData = calculateRiseTime(currentData);
-
-        // Draw rise time annotation
-        if (riseTimeData) {
-            drawRiseTimeMarker(ctx, chart, riseTimeData);
-        }
-
-        // Draw peak current line
-        drawPeakLine(ctx, chart, peakCurrent);
-
-        // Draw weld start marker (t=0 at start of main rise)
-        if (riseTimeData) {
-            drawWeldStartMarker(ctx, chart, riseTimeData);
-        }
-
-        // Draw metrics overlay
-        drawMetricsOverlay(ctx, chartArea, riseTimeData, peakCurrent);
-    }
-};
-
-// ==================== Metrics & Drawing Helpers ====================
-
-// Improved 10–90% rise time, only in main weld region
-function calculateRiseTime(data) {
-    if (!data || data.length < 3) return null;
-
-    const currents = data.map(d => d.y);
-    const times = data.map(d => d.x);
-
-    const peakCurrent = Math.max(...currents);
-    if (peakCurrent <= 0) return null;
-
-    const thresholdMain = 0.2 * peakCurrent;
-    const threshold10 = 0.10 * peakCurrent;
-    const threshold90 = 0.90 * peakCurrent;
-
-    let firstMainIdx = currents.findIndex(i => i >= thresholdMain);
-    let lastMainIdx = currents.length - 1;
-    for (let i = currents.length - 1; i >= 0; i--) {
-        if (currents[i] >= thresholdMain) {
-            lastMainIdx = i;
-            break;
-        }
-    }
-    if (firstMainIdx < 0 || lastMainIdx <= firstMainIdx) return null;
-
-    let t10 = null, t90 = null, i10 = null, i90 = null;
-
-    for (let i = firstMainIdx; i <= lastMainIdx; i++) {
-        const t = times[i];
-        const c = currents[i];
-
-        if (t10 === null && c >= threshold10) {
-            t10 = t;
-            i10 = c;
-        }
-        if (t90 === null && c >= threshold90) {
-            t90 = t;
-            i90 = c;
-            break;
-        }
-    }
-
-    if (t10 === null || t90 === null || t90 <= t10) return null;
-
-    return {
-        startTime: t10,
-        endTime: t90,
-        riseTime: t90 - t10,
-        startCurrent: i10,
-        endCurrent: i90
-    };
-}
-
-function drawRiseTimeMarker(ctx, chart, riseData) {
-    const xScale = chart.scales.x;
-    const yScale = chart.scales.y;
-
-    const x1 = xScale.getPixelForValue(riseData.startTime);
-    const x2 = xScale.getPixelForValue(riseData.endTime);
-    const y1 = yScale.getPixelForValue(riseData.startCurrent);
-    const y2 = yScale.getPixelForValue(riseData.endCurrent);
-
-    ctx.save();
-    ctx.strokeStyle = '#00ff00';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([5, 5]);
-
-    ctx.beginPath();
-    ctx.moveTo(x1, y1);
-    ctx.lineTo(x2, y2);
-    ctx.stroke();
-
-    ctx.fillStyle = '#00ff00';
-    ctx.font = 'bold 12px monospace';
-    ctx.fillText(`Rise: ${riseData.riseTime.toFixed(2)}ms`, x1 + 10, y1 - 10);
-    ctx.restore();
-}
-
-function drawPeakLine(ctx, chart, peakCurrent) {
-    const yScale = chart.scales.y;
-    const chartArea = chart.chartArea;
-    const y = yScale.getPixelForValue(peakCurrent);
-
-    ctx.save();
-    ctx.strokeStyle = '#ff6b35';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([3, 3]);
-
-    ctx.beginPath();
-    ctx.moveTo(chartArea.left, y);
-    ctx.lineTo(chartArea.right, y);
-    ctx.stroke();
-
-    ctx.fillStyle = '#ff6b35';
-    ctx.font = 'bold 11px monospace';
-    ctx.fillText(`Peak: ${peakCurrent.toFixed(1)}A`, chartArea.right - 100, y - 5);
-    ctx.restore();
-}
-
-function drawWeldStartMarker(ctx, chart, riseData) {
-    const xScale = chart.scales.x;
-    const chartArea = chart.chartArea;
-    const weldStartTime = riseData ? riseData.startTime : 0;
-    const x = xScale.getPixelForValue(weldStartTime);
-
-    ctx.save();
-    ctx.strokeStyle = '#ffff00';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([]);
-
-    ctx.beginPath();
-    ctx.moveTo(x, chartArea.top);
-    ctx.lineTo(x, chartArea.bottom);
-    ctx.stroke();
-
-    ctx.fillStyle = '#ffff00';
-    ctx.font = 'bold 12px monospace';
-    ctx.fillText('t=0', x + 5, chartArea.bottom - 10);
-    ctx.restore();
-}
-
-function drawMetricsOverlay(ctx, chartArea, riseData, peakCurrent) {
-    if (!riseData) return;
-
-    ctx.save();
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-    ctx.fillRect(chartArea.left + 10, chartArea.top + 10, 180, 80);
-
-    ctx.fillStyle = '#00ff00';
-    ctx.font = 'bold 13px monospace';
-    ctx.fillText('📊 Weld Metrics', chartArea.left + 20, chartArea.top + 30);
-
-    ctx.font = '12px monospace';
-    ctx.fillStyle = '#fff';
-    ctx.fillText(`Rise Time: ${riseData.riseTime.toFixed(2)} ms`, chartArea.left + 20, chartArea.top + 50);
-    ctx.fillText(`Peak: ${peakCurrent.toFixed(1)} A`, chartArea.left + 20, chartArea.top + 68);
-    ctx.restore();
-}
-
-// ==================== Data Processing Helpers ====================
-
-function smoothData(data, windowSize = 3) {
-    if (!data || data.length < windowSize) return data;
-
-    const smoothed = [];
-    for (let i = 0; i < data.length; i++) {
-        const start = Math.max(0, i - Math.floor(windowSize / 2));
-        const end = Math.min(data.length, i + Math.ceil(windowSize / 2));
-        const window = data.slice(start, end);
-        const avg = window.reduce((sum, d) => sum + d.y, 0) / window.length;
-        smoothed.push({ x: data[i].x, y: avg });
-    }
-    return smoothed;
-}
-
-function autoZoomChart(chart) {
-    // If user has zoomed/panned, don't fight them
-    if (chart?.isZoomedOrPanned && chart.isZoomedOrPanned()) return;
-
-    const data = chart.data.datasets[0]?.data || [];
-    if (data.length < 2) return;
-
-    const xs = data.map(d => d.x);
-    const ys = data.map(d => d.y);
-
-    const xMin = Math.min(...xs);
-    const xMax = Math.max(...xs);
-    const yMax = Math.max(...ys);
-
-    const padX = Math.max(0.2, (xMax - xMin) * 0.05);
-    const padY = Math.max(50, yMax * 0.08);
-
-    // IMPORTANT: use suggestedMin/Max instead of hard min/max
-    chart.options.scales.x.suggestedMin = xMin - padX;
-    chart.options.scales.x.suggestedMax = xMax + padX;
-
-    chart.options.scales.y.suggestedMin = 0;
-    chart.options.scales.y.suggestedMax = yMax + padY;
-
-    // and make sure hard min/max are not set
-    delete chart.options.scales.x.min;
-    delete chart.options.scales.x.max;
-    delete chart.options.scales.y.min;
-    delete chart.options.scales.y.max;
-}
-// ==================== Idealized Pulse & Energy ====================
-
-function buildCartoonPulse(data) {
-    if (!data || data.length < 4) return null;
-
-    const n = data.length;
-    const startIdx = Math.floor(n * 0.25);
-    const endIdx = Math.floor(n * 0.75);
-
-    let sumI = 0, count = 0;
-    for (let i = startIdx; i < endIdx; i++) {
-        sumI += data[i].y;
-        count++;
-    }
-    if (count === 0) return null;
-
-    const plateauCurrent = sumI / count;
-    const t0 = data[0].x;
-    const tEnd = data[n - 1].x;
-    const tRiseEnd = data[startIdx].x;
-    const tFallStart = data[endIdx - 1].x;
-
-    return [
-        { x: t0, y: 0.0 },
-        { x: tRiseEnd, y: plateauCurrent },
-        { x: tFallStart, y: plateauCurrent },
-        { x: tEnd, y: 0.0 }
-    ];
-}
-function resetZoom() {
-    if (chart?.resetZoom) chart.resetZoom();
-
-    // Clear hard min/max so pan/zoom can re-apply cleanly
-    delete chart.options.scales.x.min;
-    delete chart.options.scales.x.max;
-    delete chart.options.scales.y.min;
-    delete chart.options.scales.y.max;
-
-    chart.update();
-}
-
-
-function buildEnergyTraceFromCurrent(data, resistance_milliohm = 2.96) {
-    if (!data || data.length < 2) return null;
-
-    const R = resistance_milliohm / 1000.0;
-    const eData = [];
-    let energyJ = 0.0;
-
-    eData.push({ x: data[0].x, y: 0.0 });
-
-    for (let i = 1; i < data.length; i++) {
-        const t0 = data[i - 1].x / 1000.0;
-        const t1 = data[i].x / 1000.0;
-        const dt = t1 - t0;
-
-        const i0 = data[i - 1].y;
-        const i1 = data[i].y;
-        const iAvg = 0.5 * (i0 + i1);
-
-        const power = iAvg * iAvg * R;
-        energyJ += power * dt;
-
-        eData.push({ x: data[i].x, y: energyJ });
-    }
-
-    return eData;
-}
-
-// ==================== Chart + Socket Wiring ====================
-
+// Initialize SocketIO connection
 const socket = io();
 
-// Register chartjs-plugin-zoom once (UMD global)
-(function registerZoomPluginOnce() {
-    const zp = window.ChartZoom || window['chartjs-plugin-zoom'];
-    if (!zp) {
-        console.warn('❌ Zoom plugin global not found on window (ChartZoom / chartjs-plugin-zoom).');
+// Global chart variable
+let waveformChart = null;
+
+// Connection status
+socket.on('connect', function () {
+    console.log('SocketIO connected');
+    document.getElementById('connectionStatus').textContent = 'Connected';
+    document.getElementById('connectionStatus').className = 'connection-status connected';
+});
+
+socket.on('disconnect', function () {
+    console.log('SocketIO disconnected');
+    document.getElementById('connectionStatus').textContent = 'Disconnected';
+    document.getElementById('connectionStatus').className = 'connection-status disconnected';
+});
+
+// Initialize Chart.js when page loads
+document.addEventListener('DOMContentLoaded', function () {
+    console.log('Initializing waveform chart...');
+
+    const ctx = document.getElementById('waveformChart');
+    if (!ctx) {
+        console.error('Canvas element not found!');
         return;
     }
-    Chart.register(zp);
-    console.log('✅ Zoom plugin registered. id=', zp.id || '(no id)');
-})();
 
-// Register chartjs-plugin-zoom (local, UMD-ish build)
-(function registerZoomPlugin() {
-    const zp = window.ChartZoom || window['chartjs-plugin-zoom'];
-    console.log('zoom global =', zp);
-    if (!zp) return console.warn('❌ zoom plugin global missing');
-    Chart.register(zp);
-    console.log('✅ zoom registered:', zp.id);
-})();
-const ctx = document.getElementById('waveform-chart').getContext('2d');
-const chart = new Chart(ctx, {
-    plugins: [annotationPlugin],
-    type: 'line',
-    data: {
-        datasets: [
-            {
-                label: 'Current (A)',
-                data: [],
-                borderColor: '#ff6b35',
-                backgroundColor: 'rgba(255, 107, 53, 0.1)',
-                borderWidth: 2,
-                pointRadius: 0,
-                yAxisID: 'y'
-            },
-            {
-                label: 'Idealized Pulse',
-                data: [],
-                borderColor: '#00ff00',
-                backgroundColor: 'rgba(0, 255, 0, 0)',
-                borderWidth: 3,
-                pointRadius: 0,
-                yAxisID: 'y',
-                tension: 0
-            },
-            {
-                label: 'Voltage (V)',
-                data: [],
-                borderColor: '#2196F3',
-                backgroundColor: 'rgba(33, 150, 243, 0.1)',
-                borderWidth: 2,
-                pointRadius: 0,
-                yAxisID: 'y1'
-            },
-            {
-                label: 'Energy (J)',
-                data: [],
-                borderColor: '#00bcd4',
-                backgroundColor: 'rgba(0, 188, 212, 0)',
-                borderWidth: 2,
-                pointRadius: 0,
-                yAxisID: 'y2',
-                borderDash: [4, 2]
-            }
-        ]
-    },
-    options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        animation: false,
-
-        // IMPORTANT: allow drag events
-        events: ['mousedown', 'mousemove', 'mouseup', 'mouseout', 'click', 'touchstart', 'touchmove', 'touchend'],
-
-        scales: {
-            x: {
-                type: 'linear',
-                title: { display: true, text: 'Time (ms)', color: '#fff' },
-                ticks: { color: '#aaa' },
-                grid: { color: "#444", lineWidth: 1, drawTicks: true },
-                suggestedMin: 0,
-                suggestedMax: 20
-            },
-            y: {
-                type: 'linear',
-                position: 'left',
-                title: { display: true, text: 'Current (A)', color: '#ff6b35' },
-                ticks: { color: '#ff6b35' },
-                grid: { color: "#444", lineWidth: 1, drawTicks: true },
-                suggestedMin: 0,
-                suggestedMax: 6000
-            },
-            y1: {
-                type: 'linear',
-                position: 'right',
-                title: { display: true, text: 'Voltage (V)', color: '#2196F3' },
-                ticks: { color: '#2196F3' },
-                grid: { display: false },
-                suggestedMin: 0,
-                suggestedMax: 12
-            },
-            y2: {
-                type: 'linear',
-                position: 'right',
-                title: { display: true, text: 'Energy (J)', color: '#00bcd4' },
-                ticks: { color: '#00bcd4' },
-                grid: { display: false },
-                suggestedMin: 0
-            }
+    waveformChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: 'Current (A)',
+                    data: [],
+                    borderColor: '#ff6b35',
+                    backgroundColor: function (context) {
+                        const chart = context.chart;
+                        const { ctx: c, chartArea } = chart;
+                        if (!chartArea) return 'rgba(255,107,53,0.08)';
+                        const gradient = c.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+                        gradient.addColorStop(0, 'rgba(255,107,53,0.35)');
+                        gradient.addColorStop(0.5, 'rgba(255,107,53,0.10)');
+                        gradient.addColorStop(1, 'rgba(255,107,53,0.01)');
+                        return gradient;
+                    },
+                    fill: true,
+                    tension: 0.35,
+                    borderWidth: 3,
+                    pointRadius: 0,
+                    pointHoverRadius: 5,
+                    pointHoverBackgroundColor: '#ff6b35',
+                    pointHoverBorderColor: '#fff',
+                    pointHoverBorderWidth: 2,
+                    shadowOffsetX: 0,
+                    shadowOffsetY: 0,
+                    shadowBlur: 12,
+                    shadowColor: 'rgba(255,107,53,0.6)'
+                }
+            ]
         },
-
-        plugins: {
-            zoom: {
-                pan: {
-                    enabled: true,
-                    mode: 'xy',
-                    threshold: 0
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: {
+                duration: 400,
+                easing: 'easeOutQuart'
+            },
+            interaction: {
+                mode: 'index',
+                intersect: false,
+            },
+            plugins: {
+                legend: {
+                    display: false
                 },
-                zoom: {
-                    wheel: { enabled: true, modifierKey: 'shift' },
-                    pinch: { enabled: true },
-                    mode: 'xy'
+                tooltip: {
+                    enabled: true,
+                    backgroundColor: 'rgba(20,20,30,0.92)',
+                    borderColor: '#ff6b35',
+                    borderWidth: 1,
+                    titleColor: '#ff6b35',
+                    bodyColor: '#fff',
+                    padding: 10,
+                    callbacks: {
+                        label: function (ctx) {
+                            return '  ' + ctx.parsed.y.toFixed(1) + ' A';
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    type: 'linear',
+                    position: 'bottom',
+                    title: {
+                        display: true,
+                        text: 'Time (ms)',
+                        color: '#888',
+                        font: {
+                            size: 14,
+                            weight: 'bold'
+                        }
+                    },
+                    ticks: {
+                        color: '#888',
+                        maxTicksLimit: 12,
+                        callback: function (value) {
+                            return Number(value).toFixed(2);
+                        }
+                    },
+                    grid: {
+                        color: 'rgba(136, 136, 136, 0.1)'
+                    }
+                },
+                y: {
+                    type: 'linear',
+                    position: 'left',
+                    title: {
+                        display: true,
+                        text: 'Current (A)',
+                        color: '#ff6b35',
+                        font: {
+                            size: 14,
+                            weight: 'bold'
+                        }
+                    },
+                    min: 0,
+                    max: 2000,
+                    ticks: {
+                        color: '#ff6b35',
+                        stepSize: 250,
+                        callback: function (value) {
+                            return Number(value).toFixed(0) + ' A';
+                        }
+                    },
+                    grid: {
+                        color: 'rgba(255, 107, 53, 0.1)'
+                    }
                 }
             }
         }
+    });
+
+    console.log('Waveform chart initialized successfully');
+});
+
+// Live status updates (STATUS + STATUS2 merged)
+socket.on('status_update', function (data) {
+    // Capacitor voltage
+    const vcap = data.vcap !== undefined ? data.vcap : data.vpack;
+    if (vcap !== undefined) {
+        const el = document.getElementById('vcap');
+        if (el) el.textContent = parseFloat(vcap).toFixed(2) + ' V';
+    }
+
+    // Pack voltage
+    if (data.vpack !== undefined) {
+        const el = document.getElementById('vpack');
+        if (el) el.textContent = parseFloat(data.vpack).toFixed(2) + ' V';
+    }
+
+    // Cell voltages
+    ['cell1', 'cell2', 'cell3'].forEach(function (key) {
+        if (data[key] !== undefined) {
+            const el = document.getElementById(key);
+            if (el) el.textContent = parseFloat(data[key]).toFixed(3) + ' V';
+        }
+    });
+
+    // Temperature
+    if (data.temp !== undefined) {
+        const el = document.getElementById('temp');
+        if (el) el.textContent = parseFloat(data.temp).toFixed(1) + ' °C';
+    }
+
+    // Charge current
+    if (data.ichg !== undefined) {
+        const el = document.getElementById('ichg');
+        if (el) el.textContent = parseFloat(data.ichg).toFixed(2) + ' A';
+    }
+
+    // Armed / ready state
+    if (data.armed !== undefined) {
+        const el = document.getElementById('armedStatus');
+        if (el) el.textContent = data.armed ? 'ARMED' : 'DISARMED';
+    }
+
+    // Weld count
+    if (data.weld_count !== undefined) {
+        const el = document.getElementById('weldCount');
+        if (el) el.textContent = data.weld_count;
+    }
+
+    // ESP connection badge
+    const connEl = document.getElementById('connectionStatus');
+    if (connEl && data.esp_connected !== undefined) {
+        connEl.textContent = data.esp_connected ? 'Connected' : 'Disconnected';
+        connEl.className = 'connection-status ' + (data.esp_connected ? 'connected' : 'disconnected');
     }
 });
 
-let currentWeldData = { timestamps: [], voltage: [], current: [] };
+// Weld complete — uses fields from Python's weld_payload dict
+socket.on('weld_complete', function (data) {
+    console.log('Weld complete:', data);
 
-// live weld points from ESP
-socket.on('weld_data_point', (data) => {
-    const locked = chart?.isZoomedOrPanned && chart.isZoomedOrPanned();
+    // Python emits: peak_current_amps, avg_current_amps, duration_ms,
+    //               energy_joules (use energy_j from STM32 if present),
+    //               vcap_before, vcap_after, voltage_drop
 
-    const t_ms = data.t * 1000;
-    currentWeldData.timestamps.push(t_ms);
-    currentWeldData.voltage.push(data.v);
-    currentWeldData.current.push(data.i);
+    const peakA = data.peak_current_amps;
+    const avgA = data.avg_current_amps;
+    const durMs = data.duration_ms;
+    // Prefer backend-corrected energy_joules, fallback to raw energy_j if needed
+    const energyJ = data.energy_joules !== undefined ? data.energy_joules : data.energy_j;
+    const vDrop = data.voltage_drop !== undefined
+        ? data.voltage_drop
+        : (data.vcap_before - data.vcap_after);
 
-    chart.data.datasets[0].data.push({ x: t_ms, y: data.i });
-    chart.data.datasets[2].data.push({ x: t_ms, y: data.v });
+    const set = function (id, val, decimals) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = val !== undefined && val !== null
+            ? parseFloat(val).toFixed(decimals)
+            : '--';
+    };
 
-    // Don’t constantly rebuild these while user is interacting
-    if (!locked) {
-        const currentData = chart.data.datasets[0].data;
-        chart.data.datasets[1].data = buildCartoonPulse(currentData) || [];
-        chart.data.datasets[3].data = buildEnergyTraceFromCurrent(currentData) || [];
+    set('peakCurrent', peakA, 1);
+    set('avgCurrent', avgA, 1);
+    set('energy', energyJ, 2);
+    set('duration', durMs, 1);
+    set('voltageDrop', vDrop, 3);
+
+    // Vcap before/after/drop row
+    const vcapB = data.vcap_before;
+    const vcapA = data.vcap_after;
+    const vcapDrop = vDrop;
+
+    set('vcapBefore', vcapB, 3);
+    set('vcapAfter', vcapA, 3);
+    set('vcapDrop', vcapDrop, 3);
+
+    // Animate the drop bar (drop as % of before voltage, capped at 100%)
+    if (vcapB !== undefined && vcapB > 0 && vcapDrop !== undefined) {
+        const pct = Math.min((vcapDrop / vcapB) * 100 * 8, 100); // ×8 to exaggerate small drops visually
+        const bar = document.getElementById('vcapBar');
+        if (bar) bar.style.width = pct.toFixed(1) + '%';
     }
 
-    chart.update('none');
+    // Tip voltage if forwarded
+    if (data.v_tips !== undefined) {
+        set('vTips', data.v_tips, 3);
+    }
+
+    // Last weld timestamp
+    const now = new Date();
+    const el = document.getElementById('lastWeldTime');
+    if (el) el.textContent = now.toLocaleTimeString();
 });
 
-// weld complete summary from server
-socket.on('weld_complete', async (data) => {
-    document.getElementById('energy').textContent = data.energy_joules.toFixed(2) + ' J';
-    document.getElementById('peak-current').textContent = data.peak_current_amps.toFixed(1) + ' A';
-    document.getElementById('duration').textContent = data.duration_ms.toFixed(1) + ' ms';
-    document.getElementById('weld-num').textContent = data.weld_number;
-
-    // Refresh weld history list
-    await loadWeldHistory();
-
-    // Automatically load the most recent weld into the chart
-    await loadMostRecentWeld();
-});
-
-socket.on('pedal_active', (data) => {
+// Weld start flash
+socket.on('weld_event', function (data) {
     if (data.active) {
-        currentWeldData = { timestamps: [], voltage: [], current: [] };
-        chart.data.datasets.forEach(ds => ds.data = []);
-        chart.update();
+        console.log('Weld started');
+        const el = document.getElementById('weldStatus');
+        if (el) {
+            el.textContent = 'WELDING';
+            el.className = 'weld-status welding';
+            setTimeout(function () {
+                el.textContent = 'IDLE';
+                el.className = 'weld-status idle';
+            }, 600);
+        }
     }
 });
-// -------- History + controls (adapted from old monitor.html) --------
-async function loadMostRecentWeld() {
-    const resp = await fetch('/api/weld_history');
-    const data = await resp.json();
 
-    if (data.status === 'ok' && data.welds.length > 0) {
-        const newest = data.welds[0];
-        await loadWeldData(newest.filename);
+// Waveform data — backend emits {samples: [{voltage, current, time_ms}], count: N}
+socket.on('waveform_data', function (data) {
+    console.log('\n' + '='.repeat(60));
+    console.log('WAVEFORM DEBUG - FRONTEND');
+    console.log('='.repeat(60));
+
+    const samples = Array.isArray(data?.samples) ? data.samples : [];
+    console.log('Received waveform data:', data);
+    console.log('Sample count:', samples.length);
+
+    if (!waveformChart) {
+        console.error('❌ Chart not initialized!');
+        console.log('='.repeat(60) + '\n');
+        return;
     }
-}
-async function loadWeldHistory() {
-    const resp = await fetch('/api/weld_history');
-    const data = await resp.json();
 
-    if (data.status === 'ok' && data.welds.length > 0) {
-        const container = document.getElementById('weld-history');
-        container.innerHTML = '';
+    if (samples.length > 0) {
+        const currents = samples.map(s => Number(s.current)).filter(Number.isFinite);
+        const times = samples.map(s => Number(s.time_ms)).filter(Number.isFinite);
 
-        data.welds.forEach(weld => {
-            const item = document.createElement('div');
-            item.className = 'weld-item';
-            item.onclick = (event) => loadWeldData(weld.filename, event);
-
-            const timestamp = new Date(weld.timestamp).toLocaleString();
-
-            item.innerHTML = `
-                <div class="weld-header">
-                    <span class="weld-number">Weld #${weld.weld_number}</span>
-                    <span style="color: #aaa; font-size: 0.9em;">${timestamp}</span>
-                </div>
-                <div class="weld-stats">
-                    <div>⚡ ${weld.energy_joules.toFixed(2)} J</div>
-                    <div>📈 ${weld.peak_current_amps.toFixed(1)} A</div>
-                    <div>⏱️ ${weld.duration_ms.toFixed(1)} ms</div>
-                </div>
-            `;
-            container.appendChild(item);
-        });
-    }
-}
-
-async function loadWeldData(filename, event) {
-    const resp = await fetch(`/api/weld_data/${filename}`);
-    const weld = await resp.json();
-
-    if (weld.data) {
-        document.getElementById('energy').textContent = weld.energy_joules.toFixed(2) + ' J';
-        document.getElementById('peak-current').textContent = weld.peak_current_amps.toFixed(1) + ' A';
-        document.getElementById('duration').textContent = weld.duration_ms.toFixed(1) + ' ms';
-        document.getElementById('weld-num').textContent = weld.weld_number;
-
-        let currentData, voltageData;
-        if (Array.isArray(weld.data) && weld.data.length > 0 && 't' in weld.data[0]) {
-            // new ESP format, t in µs
-            currentData = weld.data.map(d => ({ x: d.t / 1000.0, y: d.i }));
-            voltageData = weld.data.map(d => ({ x: d.t / 1000.0, y: d.v }));
-        } else {
-            // legacy format
-            currentData = weld.data.timestamps.map((t, i) => ({
-                x: t * 1000,
-                y: weld.data.current[i]
-            }));
-            voltageData = weld.data.timestamps.map((t, i) => ({
-                x: t * 1000,
-                y: weld.data.voltage[i]
-            }));
+        console.log('\nFirst 3 samples:');
+        for (let i = 0; i < Math.min(3, samples.length); i++) {
+            console.log(`  Sample ${i}:`, samples[i]);
         }
 
-        currentData = smoothData(currentData, 3);
+        if (currents.length > 0 && times.length > 0) {
+            const minCurrent = Math.min(...currents);
+            const maxCurrent = Math.max(...currents);
+            const minTime = Math.min(...times);
+            const maxTime = Math.max(...times);
 
-        chart.data.datasets[0].data = currentData;
-        chart.data.datasets[2].data = voltageData;
-        chart.data.datasets[1].data = buildCartoonPulse(currentData) || [];
-        chart.data.datasets[3].data = buildEnergyTraceFromCurrent(currentData) || [];
+            console.log('\nData ranges:');
+            console.log('  Time:', minTime.toFixed(2), '-', maxTime.toFixed(2), 'ms');
+            console.log('  Current:', minCurrent.toFixed(1), '-', maxCurrent.toFixed(1), 'A');
+            console.log('  Variation:', (maxCurrent - minCurrent).toFixed(1), 'A');
 
-        autoZoomChart(chart);
-        chart.update();
-
-        document.querySelectorAll('.weld-item').forEach(item => item.classList.remove('active'));
-        if (event && event.target) event.target.closest('.weld-item').classList.add('active');
-    }
-}
-
-function updateYAxis() {
-    const yMax = parseFloat(document.getElementById('y-max').value);
-    chart.options.scales.y.suggestedMax = yMax;
-    delete chart.options.scales.y.max;
-    chart.update();
-}
-
-// Clear weld data button wiring
-document.addEventListener('DOMContentLoaded', async () => {
-    await loadWeldHistory();
-    await loadMostRecentWeld();
-
-    const btn = document.getElementById('clear-weld-data-btn');
-    if (btn) {
-        btn.addEventListener('click', function () {
-            if (confirm('Clear all weld data and reset counter?')) {
-                socket.emit('clear_weld_data');
+            const variation = maxCurrent - minCurrent;
+            if (variation < 10) {
+                console.warn('⚠️  WARNING: Waveform appears FLAT (variation < 10 A)');
+            } else {
+                console.log('✅ Waveform has good variation');
             }
-        });
+        }
+
+        const currentData = samples
+            .map(sample => ({
+                x: Number(sample.time_ms),
+                y: Number(sample.current)
+            }))
+            .filter(point => Number.isFinite(point.x) && Number.isFinite(point.y));
+
+        console.log('\nChart data points:', currentData.length);
+        if (currentData.length > 0) {
+            console.log('First chart point:', currentData[0]);
+            console.log('Last chart point:', currentData[currentData.length - 1]);
+
+            waveformChart.data.datasets[0].data = currentData;
+            waveformChart.update('active');
+            console.log('\n✅ Chart updated');
+        } else {
+            console.error('❌ No valid chart points after parsing!');
+        }
+    } else {
+        console.error('❌ No samples in waveform data!');
     }
 
-    socket.on('weld_data_cleared', function () {
-        console.log('✅ Weld data cleared - forcing reload...');
-        window.location.href = window.location.href;
-    });
+    console.log('='.repeat(60) + '\n');
 });
+
+// Update waveform chart — current vs time
+function updateWaveformChart(samples) {
+    if (!samples || samples.length === 0) {
+        console.warn('No samples to display');
+        return;
+    }
+
+    console.log('Updating chart with', samples.length, 'samples');
+
+    const currentData = samples.map(function (sample, i) {
+        const timeMs = sample.time_ms !== undefined ? Number(sample.time_ms) : (i * 0.2);
+        const currentA = Number(sample.current);
+        return { x: timeMs, y: currentA };
+    }).filter(function (point) {
+        return Number.isFinite(point.x) && Number.isFinite(point.y);
+    });
+
+    if (currentData.length === 0) {
+        console.warn('No valid waveform points after parsing');
+        return;
+    }
+
+    const currents = currentData.map(function (d) { return d.y; });
+    const minCurrent = Math.min(...currents);
+    const maxCurrent = Math.max(...currents);
+    console.log('Current range:', minCurrent, 'to', maxCurrent, 'A');
+
+    waveformChart.data.datasets[0].data = currentData;
+    waveformChart.update('active');
+
+    console.log('Chart updated');
+}

@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -11,19 +12,19 @@
             padding: 0;
             box-sizing: border-box;
         }
-        
+
         body {
             font-family: 'Courier New', monospace;
             background: #1a1a1a;
             color: #0f0;
             padding: 20px;
         }
-        
+
         .container {
             max-width: 1400px;
             margin: 0 auto;
         }
-        
+
         header {
             display: flex;
             justify-content: space-between;
@@ -32,18 +33,18 @@
             padding-bottom: 20px;
             border-bottom: 2px solid #333;
         }
-        
+
         h1 {
             font-size: 2em;
             color: #ff6b35;
             font-family: 'Segoe UI', sans-serif;
         }
-        
+
         .nav-links {
             display: flex;
             gap: 15px;
         }
-        
+
         .nav-links a {
             color: #fff;
             text-decoration: none;
@@ -53,26 +54,26 @@
             transition: background 0.3s;
             font-family: 'Segoe UI', sans-serif;
         }
-        
+
         .nav-links a:hover {
             background: #ff6b35;
         }
-        
+
         .panel {
             background: #000;
             border: 1px solid #333;
             border-radius: 10px;
             padding: 20px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
         }
-        
+
         .controls {
             display: flex;
             gap: 10px;
             margin-bottom: 15px;
             font-family: 'Segoe UI', sans-serif;
         }
-        
+
         .btn {
             padding: 10px 20px;
             border: none;
@@ -82,25 +83,25 @@
             transition: all 0.3s;
             font-family: 'Segoe UI', sans-serif;
         }
-        
+
         .btn-primary {
             background: #ff6b35;
             color: #fff;
         }
-        
+
         .btn-primary:hover {
             background: #ff8555;
         }
-        
+
         .btn-secondary {
             background: #333;
             color: #fff;
         }
-        
+
         .btn-secondary:hover {
             background: #444;
         }
-        
+
         .log-container {
             background: #000;
             border: 1px solid #0f0;
@@ -111,29 +112,29 @@
             font-size: 0.9em;
             line-height: 1.5;
         }
-        
+
         .log-line {
             margin-bottom: 2px;
             white-space: pre-wrap;
             word-wrap: break-word;
         }
-        
+
         .log-line.error {
             color: #f44336;
         }
-        
+
         .log-line.warning {
             color: #ff9800;
         }
-        
+
         .log-line.success {
             color: #4CAF50;
         }
-        
+
         .log-line.info {
             color: #2196F3;
         }
-        
+
         .auto-scroll {
             display: flex;
             align-items: center;
@@ -141,25 +142,137 @@
             color: #fff;
             font-family: 'Segoe UI', sans-serif;
         }
-        
+
         .auto-scroll input {
             width: 18px;
             height: 18px;
             cursor: pointer;
         }
+
+        /* ── Quick Commands ── */
+        .quick-cmds {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 10px;
+            font-family: 'Segoe UI', sans-serif;
+        }
+
+        .quick-cmds span {
+            font-size: 0.8em;
+            color: #666;
+            align-self: center;
+            white-space: nowrap;
+        }
+
+        .qbtn {
+            padding: 6px 12px;
+            border: 1px solid #333;
+            border-radius: 4px;
+            background: #111;
+            color: #0f0;
+            font-family: 'Courier New', monospace;
+            font-size: 0.8em;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .qbtn:hover {
+            border-color: #ff6b35;
+            color: #ff6b35;
+            background: #1a0a00;
+        }
+
+        .qbtn.danger {
+            border-color: #500;
+            color: #f44336;
+        }
+
+        .qbtn.danger:hover {
+            background: #1a0000;
+            border-color: #f44336;
+        }
+
+        /* ── Command Input ── */
+        .cmd-bar {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+            font-family: 'Segoe UI', sans-serif;
+        }
+
+        .cmd-prompt {
+            color: #ff6b35;
+            font-family: 'Courier New', monospace;
+            font-size: 1.1em;
+            align-self: center;
+            user-select: none;
+        }
+
+        #cmdInput {
+            flex: 1;
+            background: #0a0a0a;
+            border: 1px solid #0f0;
+            border-radius: 4px;
+            color: #0f0;
+            font-family: 'Courier New', monospace;
+            font-size: 0.95em;
+            padding: 10px 14px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        #cmdInput:focus {
+            border-color: #ff6b35;
+            box-shadow: 0 0 8px rgba(255, 107, 53, 0.2);
+        }
+
+        #cmdInput::placeholder {
+            color: #333;
+        }
+
+        #sendBtn {
+            padding: 10px 20px;
+            background: #ff6b35;
+            border: none;
+            border-radius: 4px;
+            color: #fff;
+            font-family: 'Segoe UI', sans-serif;
+            font-size: 0.95em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        #sendBtn:hover {
+            background: #ff8555;
+        }
+
+        #sendBtn:active {
+            background: #cc4a1a;
+        }
+
+        .cmd-echo {
+            color: #ff6b35 !important;
+        }
+
+        .cmd-ack {
+            color: #4CAF50 !important;
+        }
     </style>
 </head>
+
 <body>
     <div class="container">
         <header>
             <h1>📋 System Logs</h1>
             <div class="nav-links">
-                <a href="/control">Control</a>
-                <a href="/monitor">Monitor</a>
+                <a href="/">Control</a>
+                <a href="/monitor">📊 Monitor</a>
                 <a href="/logs">Logs</a>
             </div>
         </header>
-        
+
         <div class="panel">
             <div class="controls">
                 <button class="btn btn-primary" onclick="refreshLogs()">🔄 Refresh</button>
@@ -169,18 +282,39 @@
                     Auto-scroll
                 </label>
             </div>
-            
+
             <div class="log-container" id="log-container">
                 <div class="log-line">Waiting for logs...</div>
             </div>
+
+            <!-- Quick Command Buttons -->
+            <div class="quick-cmds" style="margin-top:14px;">
+                <span>Quick:</span>
+                <button class="qbtn" onclick="sendQuick('STATUS')">STATUS</button>
+                <button class="qbtn" onclick="sendQuick('STATUS2')">STATUS2</button>
+                <button class="qbtn" onclick="sendQuick('ARM')">ARM</button>
+                <button class="qbtn" onclick="sendQuick('DISARM')">DISARM</button>
+                <button class="qbtn" onclick="sendQuick('FIRE')">FIRE</button>
+                <button class="qbtn" onclick="sendQuick('CAL')">CAL</button>
+                <button class="qbtn" onclick="sendQuick('RXHEALTH')">RXHEALTH</button>
+                <button class="qbtn danger" onclick="sendQuick('REBOOT')">REBOOT</button>
+            </div>
+
+            <!-- Command Input Bar -->
+            <div class="cmd-bar">
+                <span class="cmd-prompt">STM32&gt;</span>
+                <input type="text" id="cmdInput" placeholder="type command and press Enter..." autocomplete="off"
+                    spellcheck="false" />
+                <button id="sendBtn" onclick="sendCommand()">⚡ Send</button>
+            </div>
         </div>
     </div>
-    
+
     <script>
         const socket = io();
         const logContainer = document.getElementById('log-container');
         const autoScrollCheckbox = document.getElementById('auto-scroll');
-        
+
         // Classify log line
         function classifyLog(line) {
             if (line.includes('ERROR') || line.includes('⚠️') || line.includes('failed')) {
@@ -194,49 +328,50 @@
             }
             return '';
         }
-        
+
         // Add log line
         function addLogLine(line) {
             const div = document.createElement('div');
             div.className = 'log-line ' + classifyLog(line);
             div.textContent = line;
             logContainer.appendChild(div);
-            
+
             // Auto-scroll
             if (autoScrollCheckbox.checked) {
                 logContainer.scrollTop = logContainer.scrollHeight;
             }
-            
+
             // Limit to 1000 lines
             while (logContainer.children.length > 1000) {
                 logContainer.removeChild(logContainer.firstChild);
             }
         }
-        
+
         // Load logs from server
         async function refreshLogs() {
             const resp = await fetch('/api/logs');
             const data = await resp.json();
-            
+
             logContainer.innerHTML = '';
             data.logs.forEach(line => addLogLine(line));
         }
-        
+
         // Clear logs display
         function clearLogs() {
             logContainer.innerHTML = '<div class="log-line">Logs cleared. Waiting for new logs...</div>';
         }
-        
+
         // Socket events - real-time log streaming (if implemented)
         socket.on('log_message', (data) => {
             addLogLine(data.message);
         });
-        
+
         // Initialize
         refreshLogs();
-        
+
         // Auto-refresh every 2 seconds
         setInterval(refreshLogs, 2000);
     </script>
 </body>
+
 </html>

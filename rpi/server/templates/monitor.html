@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Weld Monitor</title>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.socket.io/4.7.4/socket.io.min.js"></script>
+
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #1a1a1a;
+            color: #fff;
+            padding: 12px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+            padding-bottom: 12px;
+            border-bottom: 2px solid #333;
+            gap: 14px;
+            flex-wrap: wrap;
+        }
+
+        h1 {
+            font-size: 2em;
+            color: #ff6b35;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-left: auto;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+
+        .connection-status {
+            padding: 8px 14px;
+            border-radius: 999px;
+            font-size: 0.9em;
+            font-weight: 700;
+            border: 1px solid #666;
+            background: #333;
+            color: #ff8080;
+        }
+
+        .connection-status.connected {
+            color: #4CAF50;
+            border-color: #4CAF50;
+            background: rgba(76, 175, 80, 0.12);
+        }
+
+        .connection-status.disconnected {
+            color: #f44336;
+            border-color: #f44336;
+            background: rgba(244, 67, 54, 0.1);
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 12px;
+        }
+
+        .nav-links a {
+            color: #fff;
+            text-decoration: none;
+            padding: 10px 18px;
+            background: #333;
+            border-radius: 5px;
+            transition: background 0.3s;
+        }
+
+        .nav-links a:hover {
+            background: #ff6b35;
+        }
+
+        .panel {
+            background: #2a2a2a;
+            border-radius: 10px;
+            padding: 16px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            margin-bottom: 16px;
+        }
+
+        .panel h2 {
+            margin-bottom: 12px;
+            color: #ff6b35;
+            font-size: 1.25em;
+        }
+
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        .status-card {
+            background: #333;
+            padding: 14px;
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .card-title {
+            font-size: 0.9em;
+            color: #aaa;
+            margin-bottom: 6px;
+        }
+
+        .card-value {
+            font-size: 1.55em;
+            font-weight: bold;
+            color: #4CAF50;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .card-value.peak {
+            color: #ff6b35;
+        }
+
+        .card-value.avg {
+            color: #4CAF50;
+        }
+
+        .card-value.energy {
+            color: #2196F3;
+        }
+
+        .card-value.duration {
+            color: #FF9800;
+        }
+
+        .card-value.vdrop {
+            color: #9C27B0;
+        }
+
+        .chart-wrapper {
+            position: relative;
+            height: 360px;
+            width: 100%;
+            background: linear-gradient(180deg, #1e1e2e 0%, #2a2a3a 100%);
+            border-radius: 8px;
+            padding: 10px;
+            border: 1px solid #3a3a4a;
+            box-shadow: inset 0 0 30px rgba(255, 107, 53, 0.04);
+        }
+
+        .vcap-row {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            margin-top: 14px;
+            background: #1e1e1e;
+            border-radius: 10px;
+            padding: 14px 18px;
+            border: 1px solid #3a3a3a;
+            width: 100%;
+        }
+
+        .vcap-label {
+            font-size: 0.95em;
+            color: #aaa;
+            min-width: 88px;
+            font-weight: 600;
+        }
+
+        .vcap-before {
+            font-size: 1.2em;
+            font-weight: 700;
+            color: #4CAF50;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .vcap-arrow {
+            color: #9C27B0;
+            font-size: 1.3em;
+            font-weight: 700;
+        }
+
+        .vcap-after {
+            font-size: 1.2em;
+            font-weight: 700;
+            color: #FF9800;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .vcap-drop-badge {
+            margin-left: auto;
+            background: rgba(156, 39, 176, 0.2);
+            border: 1px solid #9C27B0;
+            border-radius: 999px;
+            padding: 8px 18px;
+            font-size: 1.15em;
+            font-weight: 700;
+            color: #e1bee7;
+            white-space: nowrap;
+        }
+
+        .vcap-bar-track {
+            flex: 1 1 520px;
+            height: 10px;
+            background: #333;
+            border-radius: 6px;
+            overflow: hidden;
+            min-width: 420px;
+            max-width: none;
+        }
+
+        .vcap-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #9C27B0, #ff6b35);
+            border-radius: 6px;
+            transition: width 0.5s ease;
+            width: 0%;
+        }
+
+        .last-weld {
+            margin-top: 10px;
+            color: #aaa;
+            font-size: 0.95em;
+        }
+
+        @media (max-width: 1200px) {
+            .status-grid {
+                grid-template-columns: repeat(3, minmax(0, 1fr));
+            }
+        }
+
+        @media (max-width: 800px) {
+            h1 {
+                font-size: 1.6em;
+            }
+
+            .status-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+
+            .header-right {
+                width: 100%;
+                justify-content: space-between;
+            }
+
+            .nav-links {
+                width: 100%;
+                justify-content: flex-end;
+            }
+
+            .vcap-row {
+                flex-wrap: wrap;
+                gap: 10px;
+            }
+
+            .vcap-bar-track {
+                order: 10;
+                min-width: 100%;
+                flex-basis: 100%;
+            }
+
+            .vcap-drop-badge {
+                margin-left: 0;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>📊 Spot Welder Monitor</h1>
+            <div class="header-right">
+                <div id="connectionStatus" class="connection-status disconnected">Disconnected</div>
+                <div class="nav-links">
+                    <a href="/">Control</a>
+                    <a href="/monitor">📊 Monitor</a>
+                    <a href="/logs">Logs</a>
+                </div>
+            </div>
+        </header>
+
+        <div class="panel">
+            <h2>Latest Weld Stats</h2>
+            <div class="status-grid">
+                <div class="status-card">
+                    <div class="card-title">Peak Current</div>
+                    <div class="card-value peak"><span id="peakCurrent">--</span> A</div>
+                </div>
+                <div class="status-card">
+                    <div class="card-title">Avg Current</div>
+                    <div class="card-value avg"><span id="avgCurrent">--</span> A</div>
+                </div>
+                <div class="status-card">
+                    <div class="card-title">Energy</div>
+                    <div class="card-value energy"><span id="energy">--</span> J</div>
+                </div>
+                <div class="status-card">
+                    <div class="card-title">Duration</div>
+                    <div class="card-value duration"><span id="duration">--</span> ms</div>
+                </div>
+                <div class="status-card">
+                    <div class="card-title">Cap V Drop</div>
+                    <div class="card-value vdrop">↓ <span id="voltageDrop">--</span> V</div>
+                </div>
+            </div>
+            <div class="last-weld">Last Weld: <span id="lastWeldTime">--:--:--</span></div>
+        </div>
+
+        <div class="panel">
+            <h2>⚡ Current Waveform</h2>
+            <div class="chart-wrapper">
+                <canvas id="waveformChart"></canvas>
+            </div>
+            <div class="vcap-row">
+                <span class="vcap-label">Cap Voltage</span>
+                <span class="vcap-before" id="vcapBefore">--.-</span>
+                <span style="color:#aaa; font-size:0.85em;">V</span>
+                <span class="vcap-arrow">→</span>
+                <span class="vcap-after" id="vcapAfter">--.-</span>
+                <span style="color:#aaa; font-size:0.85em;">V</span>
+                <div class="vcap-bar-track">
+                    <div class="vcap-bar-fill" id="vcapBar"></div>
+                </div>
+                <span class="vcap-drop-badge">↓ <span id="vcapDrop">-.---</span> V</span>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/monitor_enhanced.js"></script>
+</body>
+
+</html>
