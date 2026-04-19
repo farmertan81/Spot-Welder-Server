@@ -661,21 +661,11 @@ class ESP32Link:
                 "cell1": ("cell_1", "C1"),
                 "cell2": ("cell_2", "C2"),
                 "cell3": ("cell_3", "C3"),
-                "cell4": ("cell_4", "C4"),
             }
             for src_key, alias_keys in cell_aliases.items():
                 if src_key in parsed:
                     for alias_key in alias_keys:
                         parsed[alias_key] = parsed[src_key]
-
-            if any(k in parsed for k in ("cell1", "cell2", "cell3", "cell4")):
-                log(
-                    "🧩 STATUS2 cell mapping: "
-                    f"cell1={parsed.get('cell1')}→{parsed.get('cell_1')}, "
-                    f"cell2={parsed.get('cell2')}→{parsed.get('cell_2')}, "
-                    f"cell3={parsed.get('cell3')}→{parsed.get('cell_3')}, "
-                    f"cell4={parsed.get('cell4')}→{parsed.get('cell_4')}"
-                )
 
             # If vpack is not available for any reason, fall back to vcap if present.
             if "vpack" not in parsed and "vcap" in last_status:
