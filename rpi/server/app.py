@@ -38,11 +38,6 @@ STATUS2_CHARGE_NOISE_THRESHOLD_A = 0.2
 # UI voltage is only allowed to move if absolute change exceeds this threshold.
 STATUS2_VPACK_DEADBAND_V = 0.08
 
-# Fallback sample spacing when waveform frame lacks explicit timestamps.
-# Primary timing should come from EVENT,WELD_DONE total_ms when available.
-WAVEFORM_FALLBACK_SAMPLE_INTERVAL_MS = 0.2
-
-
 # If your ESP supports a "CELLS" command, keep True. Otherwise set False.
 REQUEST_CELLS_ON_CONNECT = True
 
@@ -57,6 +52,7 @@ esp_connected = False
 last_status = {}
 current_settings = {}
 _esp_manager_started = False
+last_weld_duration_ms = 0.0
 
 
 # ========== LOGGING ==========
@@ -307,18 +303,6 @@ class ESP32Link:
         # Last pack voltage value that was allowed through deadband filtering.
         self.last_vpack_emitted: float | None = None
 
-        # Tracks last weld duration from EVENT,WELD_DONE for waveform X-axis scaling.
-        self.last_weld_duration_ms: float | None = None
-
-        # Tracks avg current from WELD_DONE for waveform scaling debug and optional correction.
-        self.last_avg_current: float | None = None
-
-        # Buffer waveform lines if they arrive before WELD_DONE metadata.
-        self.pending_waveform: str | None = None
-
-        # Track ordering of WELD_DONE and WAVEFORM messages for race diagnostics.
-        self.message_sequence: list[str] = []
-
         self._hb_greenlet = None
         self._rx_greenlet = None
 
@@ -471,18 +455,66 @@ class ESP32Link:
     def _handle_line(self, line: str) -> None:
         global esp_connected
 
-        # Drop noisy keepalives / spammy heartbeats and STM32 debug spam
-        if line in ("TICK_1S", "PING", "PONG") or line.startswith("RXHEALTH,") or line.startswith("DBG,"):
+        # Drop noisy keepalives / spammy heartbeats
+        if line in ("TICK_1S", "PING", "PONG"):
             return
 
-        # DEBUG: Log all incoming messages with size/type hints.
-        if line.startswith("WAVEFORM"):
-            log(f"📥 TCP RX: WAVEFORM message ({len(line)} bytes)")
-        elif line.startswith("EVENT"):
-            log(f"📥 TCP RX: EVENT message ({len(line)} bytes)")
-        else:
-            preview = (line[:50] + "...") if len(line) > 50 else line
-            log(f"📥 TCP RX: {preview}")
+        log(f"📥 Received: {line}")
+
+        if not esp_connected:
+            esp_connected = True
+            emit_status_update({"esp_connected": True})
+
+        if line.startswith("STATUS,"):
+            self._parse_status(line[7:])
+    def _receive_loop(self) -> None:
+        global esp_connected
+
+        buffer = ""
+
+        while self.running and self.connected:
+            try:
+                data = self.sock.recv(1024)  # type: ignore[union-attr]
+                if not data:
+                    log("⚠️ ESP32 connection closed (recv returned empty)")
+                    break
+
+                self.last_rx = time.time()
+                buffer += data.decode("utf-8", errors="ignore")
+
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        self._handle_line(line)
+
+            except socket.timeout:
+                now = time.time()
+
+                if (now - self.connected_at) < NO_TELEM_GRACE_S:
+                    continue
+
+                if (now - self.last_rx) > NO_TELEM_RECONNECT_S:
+                    log(f"⚠️ No telemetry for {NO_TELEM_RECONNECT_S:.0f}s; forcing reconnect")
+                    break
+
+            except Exception as e:
+                log(f"❌ Receive error: {e}")
+                break
+
+        log("🧹 Receive loop exiting, cleaning up connection...")
+        self.disconnect()
+        esp_connected = False
+        emit_status_update({"esp_connected": False})
+
+    def _handle_line(self, line: str) -> None:
+        global esp_connected
+
+        # Drop noisy keepalives / spammy heartbeats
+        if line in ("TICK_1S", "PING", "PONG"):
+            return
+
+        log(f"📥 Received: {line}")
 
         if not esp_connected:
             esp_connected = True
@@ -509,8 +541,6 @@ class ESP32Link:
         elif line.startswith("CHARGER:") or line.startswith("CHARGER,"):
             payload = line.split(",", 1)[1] if "," in line else line.split(":", 1)[1]
             self._parse_charger(payload)
-        elif self._is_waveform_csv(line):
-            self._parse_bare_waveform(line)
         else:
             socketio.emit("esp32_message", {"message": line})
 
@@ -659,251 +689,57 @@ class ESP32Link:
         except Exception as e:
             log(f"⚠️ Failed to parse STATUS2: {e}")
 
-    def _resolve_waveform_dt_ms(self, sample_count: int, expected_count: int | None = None) -> float:
-        """Resolve waveform sample spacing in ms.
-
-        Priority:
-        1) Derive from last EVENT,WELD_DONE total_ms so waveform spans full weld duration.
-        2) Fall back to static spacing when duration metadata is unavailable.
-        """
-        if sample_count > 1 and self.last_weld_duration_ms and self.last_weld_duration_ms > 0.0:
-            dt_ms = self.last_weld_duration_ms / float(sample_count - 1)
-            log(
-                "⏱️ Waveform time scale: "
-                f"duration={self.last_weld_duration_ms:.3f}ms, "
-                f"samples={sample_count}, dt={dt_ms:.4f}ms"
-                + (f", expected={expected_count}" if expected_count is not None else "")
-            )
-            return dt_ms
-
-        dt_ms = WAVEFORM_FALLBACK_SAMPLE_INTERVAL_MS
-        log(
-            "⏱️ Waveform time scale fallback: "
-            f"dt={dt_ms:.4f}ms, samples={sample_count}"
-            + (f", expected={expected_count}" if expected_count is not None else "")
-        )
-        return dt_ms
-
-    def _parse_waveform(self, line: str, *, emit_event: bool = True) -> list[dict]:
-        """Parse WAVEFORM message: current,voltage pairs separated by semicolons."""
+    def _parse_waveform(self, data: str) -> None:
+        """Parse WAVEFORM,count,i1,v1,i2,v2,... and emit waveform_data."""
         try:
-            # Track message ordering for race-condition debugging.
-            self.message_sequence.append("WAVEFORM")
-            if len(self.message_sequence) > 200:
-                self.message_sequence = self.message_sequence[-200:]
-            log(f"Message sequence: {' -> '.join(self.message_sequence[-5:])}")
-
-            # Race-condition guard: if waveform arrives before WELD_DONE metadata,
-            # buffer and process after WELD_DONE updates duration/current context.
-            if self.last_weld_duration_ms is None:
-                log("⚠️  WARNING: WAVEFORM received before WELD_DONE!")
-                log("   Buffering waveform...")
-                self.pending_waveform = line
-                return []
-
-            # Normalize payload by stripping leading WAVEFORM token and optional sample count.
-            payload = line[9:] if line.startswith("WAVEFORM,") else line
-            payload = payload.strip()
-            if not payload:
-                log("⚠️ WAVEFORM payload empty")
-                return []
-
-            payload_parts = payload.split(",", 1)
-            if payload_parts and payload_parts[0].isdigit() and len(payload_parts) > 1:
-                payload = payload_parts[1]
-
-            print("\n" + "=" * 60)
-            print("WAVEFORM DEBUG - RAW MESSAGE")
-            print("=" * 60)
-            print(f"Raw message (first 200 chars): {line[:200]}")
-            if len(line) > 200:
-                print(f"... (total length: {len(line)} chars)")
-
-            raw_samples = [s for s in payload.split(";") if s.strip()]
-
-            # Fallback for flat CSV pair format: current1,voltage1,current2,voltage2,...
-            if ";" not in payload:
-                flat_parts = [p.strip() for p in payload.split(",") if p.strip()]
-                rebuilt_samples: list[str] = []
-                for idx in range(0, len(flat_parts) - 1, 2):
-                    rebuilt_samples.append(f"{flat_parts[idx]},{flat_parts[idx + 1]}")
-                raw_samples = rebuilt_samples
-
-            print(f"Sample count in raw message: {len(raw_samples)}")
-
-            print("\nFirst 5 raw samples:")
-            for i, sample in enumerate(raw_samples[:5]):
-                print(f"  Sample {i}: {sample}")
-
-            if len(raw_samples) > 5:
-                print("\nLast 2 raw samples:")
-                for i, sample in enumerate(raw_samples[-2:]):
-                    print(f"  Sample {len(raw_samples) - 2 + i}: {sample}")
-
-            print(f"\nWeld duration metadata: {self.last_weld_duration_ms} ms")
-
-            samples: list[dict] = []
-            sample_count = len(raw_samples)
-
-            if self.last_weld_duration_ms and sample_count > 1:
-                dt = self.last_weld_duration_ms / sample_count
-                print(f"Time interval (dt): {dt:.3f} ms/sample")
-            else:
-                dt = WAVEFORM_FALLBACK_SAMPLE_INTERVAL_MS
-                print(f"Time interval (dt): {dt:.3f} ms/sample (FALLBACK)")
-
-            time_ms = 0.0
-            parse_errors = 0
-
-            for i, sample in enumerate(raw_samples):
-                parts = sample.split(",")
-                if len(parts) == 2:
-                    try:
-                        current = float(parts[0])
-                        voltage = float(parts[1])
-
-                        samples.append({
-                            "time_ms": round(time_ms, 3),
-                            "voltage": round(voltage, 4),
-                            "current": round(current, 2),
-                            "index": i,
-                        })
-
-                        if i < 3:
-                            print(
-                                f"  Parsed sample {i}: time={time_ms:.2f}ms, "
-                                f"current={current:.1f}A, voltage={voltage:.3f}V"
-                            )
-
-                        time_ms += dt
-                    except (ValueError, IndexError) as e:
-                        parse_errors += 1
-                        if parse_errors <= 3:
-                            print(f"  ERROR parsing sample {i}: {sample} - {e}")
-                else:
-                    parse_errors += 1
-                    if parse_errors <= 3:
-                        print(f"  ERROR: Sample {i} has {len(parts)} parts (expected 2): {sample}")
-
-            print("\n" + "-" * 60)
-            print("WAVEFORM DEBUG - PARSED RESULTS")
-            print("-" * 60)
-
-            if samples:
-                currents = [s["current"] for s in samples]
-                voltages = [s["voltage"] for s in samples]
-                times = [s["time_ms"] for s in samples]
-
-                print(f"Successfully parsed: {len(samples)} samples")
-                print(f"Parse errors: {parse_errors}")
-                print(f"\nTime range: {min(times):.2f} - {max(times):.2f} ms")
-                print(f"Current range: {min(currents):.1f} - {max(currents):.1f} A")
-                print(f"Current variation: {max(currents) - min(currents):.1f} A")
-                print(f"Voltage range: {min(voltages):.3f} - {max(voltages):.3f} V")
-
-                avg_current = sum(currents) / len(currents)
-                print(f"\nWaveform avg current: {avg_current:.1f} A")
-                if self.last_avg_current:
-                    print(f"Stats avg current: {self.last_avg_current:.1f} A")
-                    print(f"Difference: {abs(avg_current - self.last_avg_current):.1f} A")
-
-                variation = max(currents) - min(currents)
-                if variation < 10:
-                    print("\n⚠️  WARNING: Waveform appears FLAT (variation < 10 A)")
-                    print("   This suggests data loss or timing issue!")
-                else:
-                    print(f"\n✅ Waveform has good variation ({variation:.1f} A)")
-            else:
-                print("❌ NO SAMPLES PARSED!")
-                print(f"Parse errors: {parse_errors}")
-
-            print("=" * 60 + "\n")
-
-            if emit_event and samples:
-                socketio.emit("waveform_data", {"samples": samples, "count": len(samples)})
-                log("📤 Emitting event: waveform_data")
-
-            return samples
-
-        except Exception as e:
-            log(f"⚠️ Error parsing waveform: {e}")
-            return []
-
-    def _is_waveform_csv(self, line: str) -> bool:
-        """Detect bare waveform CSV: starts with a digit/float and has multiple commas."""
-        if '=' in line or line.startswith('[') or line.startswith('{') or line.startswith('ST'):
-            return False
-        parts = line.split(',')
-        if len(parts) < 5:
-            return False
-        # If it looks like a list of numbers, it is a waveform
-        try:
-            float(parts[0])
-            float(parts[1])
-            return True
-        except (ValueError, IndexError):
-            return False
-
-    def _parse_bare_waveform(self, line: str) -> None:
-        """Parse bare CSV waveform: t_us, v1, i1, v2, i2, ..."""
-        try:
-            parts = line.split(',')
-            t_start_us = float(parts[0])
-
-            raw_pairs: list[tuple[float, float]] = []
-            i = 1
-            while i + 1 < len(parts):
-                try:
-                    voltage = float(parts[i])
-                    current = float(parts[i + 1])
-                    raw_pairs.append((voltage, current))
-                except ValueError:
-                    pass
-                i += 2
-
-            if not raw_pairs:
-                log("⚠️ Bare waveform parsed 0 samples")
+            parts = data.split(",")
+            if len(parts) < 2:
+                log(f"⚠️ WAVEFORM malformed (too short): {data}")
                 return
 
-            dt_ms = self._resolve_waveform_dt_ms(len(raw_pairs))
-
-            # If we have weld duration metadata, start from 0 so chart spans full pulse.
-            # Otherwise preserve firmware-provided base timestamp.
-            base_time_ms = 0.0 if self.last_weld_duration_ms else (t_start_us / 1000.0)
-
+            expected_count = int(parts[1])
             samples = []
-            for idx, (voltage, current) in enumerate(raw_pairs):
-                samples.append({
-                    "voltage": round(voltage, 4),
-                    "current": round(current, 2),
-                    "time_ms": round(base_time_ms + idx * dt_ms, 3),
-                    "index": idx,
-                })
 
-            payload = {"samples": samples, "count": len(samples)}
-            log(
-                "🧩 Parsed bare waveform CSV: "
-                f"samples={len(samples)}, t_start_us={t_start_us:.2f}, base_ms={base_time_ms:.3f}"
-            )
-            if samples:
-                currents = [s["current"] for s in samples]
-                log(f"Current: {min(currents):.1f} - {max(currents):.1f} A")
+            # Parse flattened current/voltage pairs.
+            for i in range(expected_count):
+                idx = 2 + (i * 2)
+                if idx + 1 < len(parts):
+                    try:
+                        current = float(parts[idx])
+                        voltage = float(parts[idx + 1])
+                        samples.append({
+                            "current": current,
+                            "voltage": voltage,
+                            "index": i,
+                        })
+                    except Exception:
+                        continue
+
+            # Map samples to weld time so final sample lands exactly at duration.
+            # Fence-post fix: N samples have (N-1) intervals.
+            sample_count = len(samples)
+            duration_ms = float(last_status.get("pulse_ms", 0.0) or 0.0)
+            if sample_count > 0 and last_weld_duration_ms > 0:
+                duration_ms = float(last_weld_duration_ms)
+
+            dt_ms = duration_ms / (sample_count - 1) if sample_count > 1 else 0.0
+            for i, sample in enumerate(samples):
+                sample["time_ms"] = i * dt_ms
+
+            payload = {
+                "samples": samples,
+                "count": expected_count,
+            }
+            log(f"🧩 Parsed WAVEFORM: expected={expected_count}, parsed={len(samples)}, duration_ms={duration_ms:.3f}, dt_ms={dt_ms:.6f}")
             socketio.emit("waveform_data", payload)
             log("📤 Emitting event: waveform_data")
 
         except Exception as e:
-            log(f"⚠️ _parse_bare_waveform error: {e}")
-            
+            log(f"⚠️ Error parsing waveform: {e}")
+
     def _parse_event(self, event: str) -> None:
+        global last_weld_duration_ms
         if event == "WELD_START":
-            # Reset per-weld metadata; this helps detect early WAVEFORM frames.
-            self.last_weld_duration_ms = None
-            self.last_avg_current = None
-            self.pending_waveform = None
-            self.message_sequence.append("WELD_START")
-            if len(self.message_sequence) > 200:
-                self.message_sequence = self.message_sequence[-200:]
-            log(f"Message sequence: {' -> '.join(self.message_sequence[-5:])}")
             socketio.emit("weld_event", {"message": "WELD_START", "active": True})
             log("📤 Emitting event: weld_event (WELD_START)")
 
@@ -920,63 +756,31 @@ class ESP32Link:
                         except Exception:
                             parsed[k] = v
 
-                # Track message ordering for race-condition debugging.
-                self.message_sequence.append("WELD_DONE")
-                if len(self.message_sequence) > 200:
-                    self.message_sequence = self.message_sequence[-200:]
-                log(f"Message sequence: {' -> '.join(self.message_sequence[-5:])}")
-
-                peak_a = float(parsed.get("peak_a", 0.0))
                 vcap_b = float(parsed.get("vcap_b", 0.0))
                 vcap_a = float(parsed.get("vcap_a", 0.0))
                 avg_a = float(parsed.get("avg_a", 0.0))
                 total_ms = float(parsed.get("total_ms", 0.0))
-
-                # DEBUG LOGGING
-                print("\n" + "=" * 60)
-                print("WELD_DONE EVENT")
-                print("=" * 60)
-                print(f"Duration: {total_ms} ms")
-                print(f"Peak current: {peak_a} A")
-                print(f"Avg current: {avg_a} A")
+                last_weld_duration_ms = total_ms
 
                 # NOTE: This uses capacitor/pack voltage (vcap), not the true arc/weld voltage.
                 # The energy number is useful for relative trending, but not physically exact.
-                # Use STM32's calculated energy if available, fall back to formula
-                joules = float(parsed.get("energy_j") or ((vcap_b + vcap_a) * avg_a * total_ms / 4000.0))
-                print(f"Energy: {joules} J")
-                print("=" * 60 + "\n")
-
-                # Store metadata for waveform parsing context.
-                self.last_weld_duration_ms = total_ms if total_ms > 0.0 else None
-                self.last_avg_current = avg_a if avg_a > 0.0 else None
+                joules = ((vcap_b + vcap_a) * avg_a * total_ms / 2000.0)
 
                 voltage_drop = float(parsed.get("delta_v", vcap_b - vcap_a))
 
                 weld_payload = {
-                    "peak_current_amps": peak_a,
+                    "peak_current_amps": float(parsed.get("peak_a", 0.0)),
                     "avg_current_amps": avg_a,
                     "duration_ms": total_ms,
                     "energy_joules": joules,
                     "vcap_before": vcap_b,
                     "vcap_after": vcap_a,
                     "voltage_drop": voltage_drop,
-                    "v_tips": float(parsed["v_tips"]) if "v_tips" in parsed else None,
                 }
 
                 log(f"🧩 Parsed WELD_DONE: {parsed}")
                 socketio.emit("weld_complete", weld_payload)
                 log(f"📤 Emitting event: weld_complete {weld_payload}")
-
-                # Process pending waveform if any.
-                if self.pending_waveform:
-                    buffered = self.pending_waveform
-                    self.pending_waveform = None
-                    log("Processing buffered waveform...")
-                    samples = self._parse_waveform(buffered, emit_event=False)
-                    if samples:
-                        socketio.emit("waveform_data", {"samples": samples, "count": len(samples)})
-                        log(f"✅ Emitted {len(samples)} buffered samples to frontend")
             except Exception as e:
                 log(f"⚠️ Failed to parse WELD_DONE: {e}")
 

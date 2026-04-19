@@ -35,109 +35,77 @@ document.addEventListener('DOMContentLoaded', function () {
                 {
                     label: 'Current (A)',
                     data: [],
-                    borderColor: '#ff6b35',
-                    backgroundColor: function (context) {
-                        const chart = context.chart;
-                        const { ctx: c, chartArea } = chart;
-                        if (!chartArea) return 'rgba(255,107,53,0.08)';
-                        const gradient = c.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
-                        gradient.addColorStop(0, 'rgba(255,107,53,0.35)');
-                        gradient.addColorStop(0.5, 'rgba(255,107,53,0.10)');
-                        gradient.addColorStop(1, 'rgba(255,107,53,0.01)');
-                        return gradient;
-                    },
-                    fill: true,
-                    tension: 0.35,
-                    borderWidth: 3,
-                    pointRadius: 0,
-                    pointHoverRadius: 5,
-                    pointHoverBackgroundColor: '#ff6b35',
-                    pointHoverBorderColor: '#fff',
-                    pointHoverBorderWidth: 2,
-                    shadowOffsetX: 0,
-                    shadowOffsetY: 0,
-                    shadowBlur: 12,
-                    shadowColor: 'rgba(255,107,53,0.6)'
+                    borderColor: 'rgb(255, 99, 132)',
+                    backgroundColor: 'rgba(255, 99, 132, 0.1)',
+                    yAxisID: 'y-current',
+                    tension: 0.1,
+                    borderWidth: 2
+                },
+                {
+                    label: 'Voltage (V)',
+                    data: [],
+                    borderColor: 'rgb(54, 162, 235)',
+                    backgroundColor: 'rgba(54, 162, 235, 0.1)',
+                    yAxisID: 'y-voltage',
+                    tension: 0.1,
+                    borderWidth: 2
                 }
             ]
         },
         options: {
             responsive: true,
             maintainAspectRatio: false,
-            animation: {
-                duration: 400,
-                easing: 'easeOutQuart'
-            },
             interaction: {
                 mode: 'index',
                 intersect: false,
             },
             plugins: {
                 legend: {
-                    display: false
+                    display: true,
+                    position: 'top'
                 },
                 tooltip: {
-                    enabled: true,
-                    backgroundColor: 'rgba(20,20,30,0.92)',
-                    borderColor: '#ff6b35',
-                    borderWidth: 1,
-                    titleColor: '#ff6b35',
-                    bodyColor: '#fff',
-                    padding: 10,
-                    callbacks: {
-                        label: function (ctx) {
-                            return '  ' + ctx.parsed.y.toFixed(1) + ' A';
-                        }
-                    }
+                    enabled: true
                 }
             },
             scales: {
                 x: {
                     type: 'linear',
-                    position: 'bottom',
                     title: {
                         display: true,
-                        text: 'Time (ms)',
-                        color: '#888',
-                        font: {
-                            size: 14,
-                            weight: 'bold'
-                        }
+                        text: 'Time (ms)'
                     },
                     ticks: {
-                        color: '#888',
-                        maxTicksLimit: 12,
                         callback: function (value) {
                             return Number(value).toFixed(2);
                         }
                     },
                     grid: {
-                        color: 'rgba(136, 136, 136, 0.1)'
+                        color: 'rgba(0, 0, 0, 0.05)'
                     }
                 },
-                y: {
+                'y-current': {
                     type: 'linear',
+                    display: true,
                     position: 'left',
                     title: {
                         display: true,
-                        text: 'Current (A)',
-                        color: '#ff6b35',
-                        font: {
-                            size: 14,
-                            weight: 'bold'
-                        }
-                    },
-                    min: 0,
-                    max: 2000,
-                    ticks: {
-                        color: '#ff6b35',
-                        stepSize: 250,
-                        callback: function (value) {
-                            return Number(value).toFixed(0) + ' A';
-                        }
+                        text: 'Current (A)'
                     },
                     grid: {
-                        color: 'rgba(255, 107, 53, 0.1)'
+                        color: 'rgba(255, 99, 132, 0.1)'
+                    }
+                },
+                'y-voltage': {
+                    type: 'linear',
+                    display: true,
+                    position: 'right',
+                    title: {
+                        display: true,
+                        text: 'Voltage (V)'
+                    },
+                    grid: {
+                        drawOnChartArea: false,
                     }
                 }
             }
@@ -147,60 +115,119 @@ document.addEventListener('DOMContentLoaded', function () {
     console.log('Waveform chart initialized successfully');
 });
 
-// Live status updates (STATUS + STATUS2 merged)
-socket.on('status_update', function (data) {
-    // Capacitor voltage
-    const vcap = data.vcap !== undefined ? data.vcap : data.vpack;
-    if (vcap !== undefined) {
-        const el = document.getElementById('vcap');
-        if (el) el.textContent = parseFloat(vcap).toFixed(2) + ' V';
+// Listen for weld complete events
+socket.on('weld_complete', function (data) {
+    console.log('Weld complete:', data);
+
+    // Update stats
+    document.getElementById('peakCurrent').textContent = data.peak_current_amps?.toFixed(2) || '--';
+    document.getElementById('avgCurrent').textContent = data.avg_current_amps?.toFixed(2) || '--';
+    document.getElementById('energy').textContent = data.energy_joules?.toFixed(2) || '--';
+    document.getElementById('duration').textContent = data.duration_ms?.toFixed(1) || '--';
+
+    const vDrop = (data.vcap_before - data.vcap_after)?.toFixed(2) || '--';
+    document.getElementById('voltageDrop').textContent = vDrop;
+
+    // Update last weld time
+    const now = new Date();
+    document.getElementById('lastWeldTime').textContent = now.toLocaleTimeString();
+});
+
+// Listen for waveform data
+socket.on('waveform_data', function (data) {
+    console.log('Waveform data received:', data.count, 'samples');
+
+    if (!waveformChart) {
+        console.error('Chart not initialized!');
+        return;
     }
 
-    // Pack voltage
-    if (data.vpack !== undefined) {
-        const el = document.getElementById('vpack');
-        if (el) el.textContent = parseFloat(data.vpack).toFixed(2) + ' V';
+    updateWaveformChart(data.samples);
+});
+
+// Update waveform chart
+function updateWaveformChart(samples) {
+    if (!samples || samples.length === 0) {
+        console.warn('No samples to display');
+        return;
     }
 
-    // Cell voltages
-    ['cell1', 'cell2', 'cell3'].forEach(function (key) {
-        if (data[key] !== undefined) {
-            const el = document.getElementById(key);
-            if (el) el.textContent = parseFloat(data[key]).toFixed(3) + ' V';
-        }
+    console.log('Updating chart with', samples.length, 'samples');
+
+    // Build points using backend time_ms (fallback to index when missing)
+    const currentPoints = samples.map((sample, index) => {
+        const timeMs = Number.isFinite(Number(sample.time_ms)) ? Number(sample.time_ms) : index;
+        return {
+            x: timeMs,
+            y: Number(sample.current) || 0
+        };
     });
 
-    // Temperature
-    if (data.temp !== undefined) {
-        const el = document.getElementById('temp');
-        if (el) el.textContent = parseFloat(data.temp).toFixed(1) + ' °C';
-    }
+    const voltagePoints = samples.map((sample, index) => {
+        const timeMs = Number.isFinite(Number(sample.time_ms)) ? Number(sample.time_ms) : index;
+        return {
+            x: timeMs,
+            y: Number(sample.voltage) || 0
+        };
+    });
 
-    // Charge current
-    if (data.ichg !== undefined) {
-        const el = document.getElementById('ichg');
-        if (el) el.textContent = parseFloat(data.ichg).toFixed(2) + ' A';
-    }
+    // Keep x-axis tightly fit to received waveform range
+    const minTime = currentPoints[0].x;
+    const maxTime = currentPoints[currentPoints.length - 1].x;
+    waveformChart.options.scales.x.min = minTime;
+    waveformChart.options.scales.x.max = maxTime;
 
-    // Armed / ready state
-    if (data.armed !== undefined) {
-        const el = document.getElementById('armedStatus');
-        if (el) el.textContent = data.armed ? 'ARMED' : 'DISARMED';
-    }
+    // Update chart
+    waveformChart.data.labels = [];
+    waveformChart.data.datasets[0].data = currentPoints;
+    waveformChart.data.datasets[1].data = voltagePoints;
+    waveformChart.update();
 
-    // Weld count
-    if (data.weld_count !== undefined) {
-        const el = document.getElementById('weldCount');
-        if (el) el.textContent = data.weld_count;
-    }
+    const currentValues = currentPoints.map(point => point.y);
+    const voltageValues = voltagePoints.map(point => point.y);
 
-    // ESP connection badge
-    const connEl = document.getElementById('connectionStatus');
-    if (connEl && data.esp_connected !== undefined) {
-        connEl.textContent = data.esp_connected ? 'Connected' : 'Disconnected';
-        connEl.className = 'connection-status ' + (data.esp_connected ? 'connected' : 'disconnected');
+    console.log('Chart updated successfully');
+    console.log('Time range:', minTime.toFixed(2), '-', maxTime.toFixed(2), 'ms');
+    console.log('Current range:', Math.min(...currentValues).toFixed(2), '-', Math.max(...currentValues).toFixed(2), 'A');
+    console.log('Voltage range:', Math.min(...voltageValues).toFixed(2), '-', Math.max(...voltageValues).toFixed(2), 'V');
+}
+['cell1', 'cell2', 'cell3'].forEach(function (key) {
+    if (data[key] !== undefined) {
+        const el = document.getElementById(key);
+        if (el) el.textContent = parseFloat(data[key]).toFixed(3) + ' V';
     }
 });
+
+// Temperature
+if (data.temp !== undefined) {
+    const el = document.getElementById('temp');
+    if (el) el.textContent = parseFloat(data.temp).toFixed(1) + ' °C';
+}
+
+// Charge current
+if (data.ichg !== undefined) {
+    const el = document.getElementById('ichg');
+    if (el) el.textContent = parseFloat(data.ichg).toFixed(2) + ' A';
+}
+
+// Armed / ready state
+if (data.armed !== undefined) {
+    const el = document.getElementById('armedStatus');
+    if (el) el.textContent = data.armed ? 'ARMED' : 'DISARMED';
+}
+
+// Weld count
+if (data.weld_count !== undefined) {
+    const el = document.getElementById('weldCount');
+    if (el) el.textContent = data.weld_count;
+}
+
+// ESP connection badge
+const connEl = document.getElementById('connectionStatus');
+if (connEl && data.esp_connected !== undefined) {
+    connEl.textContent = data.esp_connected ? 'Connected' : 'Disconnected';
+    connEl.className = 'connection-status ' + (data.esp_connected ? 'connected' : 'disconnected');
+};
 
 // Weld complete — uses fields from Python's weld_payload dict
 socket.on('weld_complete', function (data) {
