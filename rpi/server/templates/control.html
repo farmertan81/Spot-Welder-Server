@@ -896,12 +896,7 @@
                 document.getElementById('mode').dispatchEvent(new Event('change'));
                 updateActiveSettings();
 
-                const st = await fetch('/api/status').then(r => r.json());
-                if (st.esp_connected) {
-                    await saveSettings(true);
-                } else {
-                    console.log('ESP not connected yet; not auto-applying');
-                }
+                console.log('Loaded saved/web-learned settings. Waiting for authoritative live status from ESP32.');
             }
         }
 
@@ -1137,7 +1132,13 @@
             }
 
             if (data.trigger_mode !== undefined) {
-                liveTriggerMode = data.trigger_mode === 'contact' || data.trigger_mode === 1 ? 'contact' : 'pedal';
+                const rawTrigger = data.trigger_mode;
+                if (rawTrigger === 'contact' || rawTrigger === 2 || rawTrigger === '2') {
+                    liveTriggerMode = 'contact';
+                } else {
+                    // Protocol: 1=pedal, 2=contact
+                    liveTriggerMode = 'pedal';
+                }
             }
 
             if (data.contact_hold_steps !== undefined) {
