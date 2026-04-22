@@ -13,5 +13,5 @@
   "preheat_gap_ms": 3,
   "trigger_mode": "pedal",
   "contact_hold_steps": 2,
-  "contact_with_pedal": true
+  "lead_resistance_mohm": 1.87
 }

@@ -41,6 +41,10 @@ STATUS2_VPACK_DEADBAND_V = 0.08
 # If your ESP supports a "CELLS" command, keep True. Otherwise set False.
 REQUEST_CELLS_ON_CONNECT = True
 
+LEAD_RESISTANCE_DEFAULT_MOHM = 1.87
+LEAD_RESISTANCE_MIN_MOHM = 0.10
+LEAD_RESISTANCE_MAX_MOHM = 10.00
+
 # ========== FLASK SETUP ==========
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "spot-welder-secret-2024"
@@ -65,6 +69,20 @@ def log(msg: str) -> None:
             f.write(log_line + "\n")
     except Exception as e:
         print(f"⚠️ Failed to write log: {e}")
+
+
+def _normalize_lead_resistance_mohm(value) -> float:
+    """Clamp/validate user-supplied lead resistance (mΩ)."""
+    try:
+        v = float(value)
+    except Exception:
+        return LEAD_RESISTANCE_DEFAULT_MOHM
+
+    if v < LEAD_RESISTANCE_MIN_MOHM:
+        return LEAD_RESISTANCE_MIN_MOHM
+    if v > LEAD_RESISTANCE_MAX_MOHM:
+        return LEAD_RESISTANCE_MAX_MOHM
+    return round(v, 3)
 
 
 def emit_status_update(patch: dict | None = None) -> None:
@@ -96,6 +114,12 @@ def load_settings() -> dict:
                 settings["trigger_mode"] = "pedal"
             if "contact_hold_steps" not in settings:
                 settings["contact_hold_steps"] = 2
+            if "lead_resistance_mohm" not in settings:
+                settings["lead_resistance_mohm"] = LEAD_RESISTANCE_DEFAULT_MOHM
+
+            settings["lead_resistance_mohm"] = _normalize_lead_resistance_mohm(
+                settings.get("lead_resistance_mohm", LEAD_RESISTANCE_DEFAULT_MOHM)
+            )
 
             return settings
         except Exception as e:
@@ -116,6 +140,7 @@ def load_settings() -> dict:
         "active_preset": None,
         "trigger_mode": "pedal",
         "contact_hold_steps": 2,
+        "lead_resistance_mohm": LEAD_RESISTANCE_DEFAULT_MOHM,
     }
 
 
@@ -250,6 +275,9 @@ def push_settings_to_esp(log_prefix: str = "") -> None:
     pre_gap = s.get("preheat_gap_ms", 3)
 
     trigger_mode = str(s.get("trigger_mode", "pedal")).strip().lower()
+    lead_r_mohm = _normalize_lead_resistance_mohm(
+        s.get("lead_resistance_mohm", LEAD_RESISTANCE_DEFAULT_MOHM)
+    )
 
     try:
         contact_hold_steps = int(s.get("contact_hold_steps", 2))
@@ -271,6 +299,7 @@ def push_settings_to_esp(log_prefix: str = "") -> None:
     cmd_pre     = f"SET_PREHEAT,{pre_en},{pre_ms},{pre_pct},{pre_gap}"
     cmd_trigger = f"SET_TRIGGER_MODE,{trigger_mode_num}"
     cmd_contact = f"SET_CONTACT_HOLD,{contact_hold_steps}"
+    cmd_lead_r = f"SET_LEAD_R,{lead_r_mohm:.3f}"
 
     log(f"{log_prefix}➡️ Syncing settings to ESP: {cmd_pulse}")
     esp_link.send_command(cmd_pulse)
@@ -286,6 +315,9 @@ def push_settings_to_esp(log_prefix: str = "") -> None:
 
     log(f"{log_prefix}➡️ Syncing contact hold to ESP: {cmd_contact}")
     esp_link.send_command(cmd_contact)
+
+    log(f"{log_prefix}➡️ Syncing lead resistance to ESP: {cmd_lead_r}")
+    esp_link.send_command(cmd_lead_r)
 
 
 # ========== ESP32 TCP LINK ==========
@@ -926,6 +958,12 @@ def api_save_settings():
         data["trigger_mode"] = "pedal"
     if "contact_hold_steps" not in data:
         data["contact_hold_steps"] = 2
+    if "lead_resistance_mohm" not in data:
+        data["lead_resistance_mohm"] = LEAD_RESISTANCE_DEFAULT_MOHM
+
+    data["lead_resistance_mohm"] = _normalize_lead_resistance_mohm(
+        data.get("lead_resistance_mohm", LEAD_RESISTANCE_DEFAULT_MOHM)
+    )
 
     if not save_settings(data):
         return jsonify({"status": "error", "message": "Failed to save settings"}), 500
@@ -1003,6 +1041,7 @@ def api_save_preset():
     # Force trigger settings OUT of presets if UI accidentally sends them
     preset_data.pop("trigger_mode", None)
     preset_data.pop("contact_hold_steps", None)
+    preset_data.pop("lead_resistance_mohm", None)
 
     presets = load_presets()
     presets[preset_id] = preset_data

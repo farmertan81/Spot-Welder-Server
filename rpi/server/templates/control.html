@@ -674,6 +674,13 @@
                     <input type="hidden" id="triggerMode" value="pedal">
                     <input type="hidden" id="contactHoldSteps" value="2">
 
+                    <div class="form-group tight-divider">
+                        <label>Lead Resistance (mΩ)</label>
+                        <input type="number" id="leadResistance" value="1.87" min="0.10" max="10.00" step="0.01">
+                        <div class="inline-note">Range: 0.10–10.00 mΩ</div>
+                        <div class="inline-note" id="leadResistanceLive">Current STM32: -- mΩ</div>
+                    </div>
+
                     <button class="btn btn-primary"
                         style="width: 72px; margin-top: 8px; padding: 6px 10px; font-size: 0.85em;"
                         onclick="saveSettings()">Save</button>
@@ -823,6 +830,7 @@
 
             const triggerMode = document.getElementById('triggerMode').value;
             const contactHoldSteps = document.getElementById('contactHoldSteps').value;
+            const leadResistance = parseFloat(document.getElementById('leadResistance').value || '1.87');
 
             let modeText = '';
             let pulseText = '';
@@ -843,7 +851,8 @@
                 ? ` | 🎯Probe Contact (${holdStepsToSecondsText(contactHoldSteps)})`
                 : ' | 🎯Pedal';
 
-            const display = `${modeText} | ${pulseText} | ⚡${power}%${preheatText}${triggerText}`;
+            const leadText = Number.isFinite(leadResistance) ? ` | 🔌Lead ${leadResistance.toFixed(2)}mΩ` : '';
+            const display = `${modeText} | ${pulseText} | ⚡${power}%${preheatText}${triggerText}${leadText}`;
             const el = document.getElementById('active-settings');
             if (el) el.textContent = display;
         }
@@ -893,6 +902,11 @@
                 setTriggerMode(s.trigger_mode || 'pedal');
                 setContactHold(parseInt(s.contact_hold_steps || 2, 10));
 
+                if (s.lead_resistance_mohm !== undefined) {
+                    const leadEl = document.getElementById('leadResistance');
+                    if (leadEl) leadEl.value = Number(s.lead_resistance_mohm).toFixed(2);
+                }
+
                 document.getElementById('mode').dispatchEvent(new Event('change'));
                 updateActiveSettings();
 
@@ -922,7 +936,8 @@
                 preheat_gap_ms: parseInt(document.getElementById('preheatGap').value, 10),
 
                 trigger_mode: document.getElementById('triggerMode').value,
-                contact_hold_steps: parseInt(document.getElementById('contactHoldSteps').value, 10)
+                contact_hold_steps: parseInt(document.getElementById('contactHoldSteps').value, 10),
+                lead_resistance_mohm: parseFloat(document.getElementById('leadResistance').value)
             };
 
             const resp = await fetch('/api/save_settings', {
@@ -1144,6 +1159,21 @@
                 liveContactHoldSteps = parseInt(data.contact_hold_steps, 10) || 2;
             }
 
+            let leadMohm = null;
+            if (typeof data.lead_r_mohm === 'number') {
+                leadMohm = data.lead_r_mohm;
+            } else if (typeof data.lead_r_ohm === 'number') {
+                leadMohm = data.lead_r_ohm * 1000.0;
+            }
+            if (leadMohm !== null && Number.isFinite(leadMohm)) {
+                const liveEl = document.getElementById('leadResistanceLive');
+                if (liveEl) liveEl.textContent = `Current STM32: ${leadMohm.toFixed(3)} mΩ`;
+                const leadInput = document.getElementById('leadResistance');
+                if (leadInput && document.activeElement !== leadInput) {
+                    leadInput.value = leadMohm.toFixed(2);
+                }
+            }
+
             updateChargerCurrent(data);
 
             if (data.mode !== undefined) {
@@ -1239,7 +1269,8 @@
                 'powerInput', 'powerSlider',
                 'preheatEnable', 'preheatDuration', 'preheatDurationSlider',
                 'preheatPower', 'preheatPowerSlider',
-                'preheatGap', 'preheatGapSlider'
+                'preheatGap', 'preheatGapSlider',
+                'leadResistance'
             ].forEach(id => {
                 const el = document.getElementById(id);
                 if (!el) return;
