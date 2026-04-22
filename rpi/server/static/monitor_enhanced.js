@@ -152,9 +152,11 @@ socket.on('waveform_data', function (data) {
     waveformChart.options.scales.x.min = minT;
     waveformChart.options.scales.x.max = maxT;
 
-    // Auto-scale Y to peak with 10% headroom
+    // Auto-scale Y directly from waveform peak (no fixed 2000A floor).
     const peakA = Math.max(...currentPts.map(p => p.y));
-    waveformChart.options.scales.y.max = Math.max(2000, Math.ceil(peakA * 1.1 / 100) * 100);
+    const yHeadroom = Math.max(5, peakA * 0.12);
+    const yMax = Math.ceil((peakA + yHeadroom) / 10) * 10;
+    waveformChart.options.scales.y.max = Math.max(20, yMax);
 
     waveformChart.data.labels = [];
     waveformChart.data.datasets[0].data = currentPts;

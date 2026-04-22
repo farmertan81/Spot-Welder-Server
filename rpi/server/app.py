@@ -30,6 +30,10 @@ RECONNECT_MAX_DELAY_S = 8.0
 
 HEARTBEAT_INTERVAL_S = 5.0  # Send PING every 5 seconds to keep connection alive
 
+# Filter tiny INA226 charger-current noise from STATUS2 before UI emit.
+# Values below this threshold are treated as 0.0A to suppress phantom flashes.
+STATUS2_CHARGE_NOISE_THRESHOLD_A = 0.2
+
 # Deadband for pack voltage display smoothing (STATUS2 INA226 telemetry).
 # UI voltage is only allowed to move if absolute change exceeds this threshold.
 STATUS2_VPACK_DEADBAND_V = 0.08
@@ -49,39 +53,6 @@ last_status = {}
 current_settings = {}
 _esp_manager_started = False
 last_weld_duration_ms = 0.0
-
-SETTINGS_PERSIST_DEBOUNCE_S = 0.6
-
-# Authoritative settings fields learned from ESP32 STATUS.
-PERSISTABLE_STATUS_KEYS = {
-    "mode",
-    "d1",
-    "gap1",
-    "d2",
-    "gap2",
-    "d3",
-    "power_pct",
-    "preheat_en",
-    "preheat_ms",
-    "preheat_pct",
-    "preheat_gap_ms",
-    "trigger_mode",
-    "contact_hold_steps",
-    "contact_with_pedal",
-}
-
-# Live-only runtime fields from STATUS/STATUS2: never persisted as defaults.
-LIVE_RUNTIME_STATUS_KEYS = {
-    "enabled", "armed", "ready", "welding", "state",
-    "cooldown_ms", "charger_on", "chg_en",
-    "vpack", "vlow", "vmid", "vcap",
-    "cell1", "cell2", "cell3", "cell_1", "cell_2", "cell_3", "C1", "C2", "C3",
-    "ichg", "charge_a", "iweld", "ina_ok", "temp", "temperature", "current", "i", "weld_count", "weld_counter",
-}
-
-persistable_settings_state = {}
-live_runtime_state = {}
-_settings_save_greenlet = None
 
 
 # ========== LOGGING ==========
@@ -125,8 +96,6 @@ def load_settings() -> dict:
                 settings["trigger_mode"] = "pedal"
             if "contact_hold_steps" not in settings:
                 settings["contact_hold_steps"] = 2
-            if "contact_with_pedal" not in settings:
-                settings["contact_with_pedal"] = True
 
             return settings
         except Exception as e:
@@ -147,7 +116,6 @@ def load_settings() -> dict:
         "active_preset": None,
         "trigger_mode": "pedal",
         "contact_hold_steps": 2,
-        "contact_with_pedal": True,
     }
 
 
@@ -159,114 +127,6 @@ def save_settings(settings: dict) -> bool:
     except Exception as e:
         log(f"⚠️ Failed to save settings: {e}")
         return False
-
-
-def _normalize_trigger_mode(raw_mode) -> str:
-    if isinstance(raw_mode, str):
-        mode_s = raw_mode.strip().lower()
-        if mode_s in ("pedal", "contact"):
-            return mode_s
-        if mode_s == "2":
-            return "contact"
-        return "pedal"
-
-    try:
-        mode_num = int(raw_mode)
-    except Exception:
-        return "pedal"
-
-    # Protocol: 1=pedal, 2=contact
-    return "contact" if mode_num == 2 else "pedal"
-
-
-def _normalize_contact_hold_steps(raw_steps) -> int:
-    try:
-        steps = int(raw_steps)
-    except Exception:
-        steps = 2
-    if steps < 1:
-        return 1
-    if steps > 10:
-        return 10
-    return steps
-
-
-def _persist_current_settings_debounced() -> None:
-    global _settings_save_greenlet, current_settings
-
-    eventlet.sleep(SETTINGS_PERSIST_DEBOUNCE_S)
-
-    try:
-        save_settings(current_settings)
-    finally:
-        _settings_save_greenlet = None
-
-
-def schedule_settings_persist() -> None:
-    global _settings_save_greenlet
-    if _settings_save_greenlet is None:
-        _settings_save_greenlet = eventlet.spawn(_persist_current_settings_debounced)
-
-
-def learn_persistable_settings_from_status(status: dict) -> bool:
-    """
-    Learn persistable defaults from authoritative ESP32 STATUS.
-    Returns True if any persisted field changed.
-    """
-    global current_settings, persistable_settings_state
-
-    if not status:
-        return False
-
-    s = dict(current_settings or load_settings())
-    changed = False
-
-    mapping = {
-        "mode": ("mode", int),
-        "d1": ("d1", int),
-        "gap1": ("gap1", int),
-        "d2": ("d2", int),
-        "gap2": ("gap2", int),
-        "d3": ("d3", int),
-        "power_pct": ("power", int),
-        "preheat_en": ("preheat_enabled", lambda v: int(v) == 1),
-        "preheat_ms": ("preheat_duration", int),
-        "preheat_pct": ("preheat_power", int),
-        "preheat_gap_ms": ("preheat_gap_ms", int),
-        "trigger_mode": ("trigger_mode", _normalize_trigger_mode),
-        "contact_hold_steps": ("contact_hold_steps", _normalize_contact_hold_steps),
-        "contact_with_pedal": ("contact_with_pedal", lambda v: int(v) == 1),
-    }
-
-    for src_key in PERSISTABLE_STATUS_KEYS:
-        if src_key not in status or src_key not in mapping:
-            continue
-
-        dest_key, caster = mapping[src_key]
-        try:
-            new_val = caster(status[src_key])
-        except Exception:
-            continue
-
-        if s.get(dest_key) != new_val:
-            s[dest_key] = new_val
-            changed = True
-
-        persistable_settings_state[dest_key] = new_val
-
-    if changed:
-        current_settings = s
-        schedule_settings_persist()
-
-    return changed
-
-
-def update_live_runtime_state(status: dict) -> None:
-    if not status:
-        return
-    for key in LIVE_RUNTIME_STATUS_KEYS:
-        if key in status:
-            live_runtime_state[key] = status[key]
 
 
 def load_presets() -> dict:
@@ -389,21 +249,28 @@ def push_settings_to_esp(log_prefix: str = "") -> None:
     pre_pct = s.get("preheat_power", 30)
     pre_gap = s.get("preheat_gap_ms", 3)
 
-    trigger_mode = _normalize_trigger_mode(s.get("trigger_mode", "pedal"))
-    contact_hold_steps = _normalize_contact_hold_steps(s.get("contact_hold_steps", 2))
-    contact_with_pedal = 1 if bool(s.get("contact_with_pedal", True)) else 0
+    trigger_mode = str(s.get("trigger_mode", "pedal")).strip().lower()
+
+    try:
+        contact_hold_steps = int(s.get("contact_hold_steps", 2))
+    except Exception:
+        contact_hold_steps = 2
+
+    if contact_hold_steps < 1:
+        contact_hold_steps = 1
+    if contact_hold_steps > 10:
+        contact_hold_steps = 10
 
     # ESP protocol:
     # 1 = pedal
     # 2 = contact
     trigger_mode_num = 2 if trigger_mode == "contact" else 1
 
-    cmd_pulse = f"SET_PULSE,{mode},{d1},{gap1},{d2},{gap2},{d3}"
-    cmd_power = f"SET_POWER,{power}"
-    cmd_pre = f"SET_PREHEAT,{pre_en},{pre_ms},{pre_pct},{pre_gap}"
+    cmd_pulse   = f"SET_PULSE,{mode},{d1},{gap1},{d2},{gap2},{d3}"
+    cmd_power   = f"SET_POWER,{power}"
+    cmd_pre     = f"SET_PREHEAT,{pre_en},{pre_ms},{pre_pct},{pre_gap}"
     cmd_trigger = f"SET_TRIGGER_MODE,{trigger_mode_num}"
     cmd_contact = f"SET_CONTACT_HOLD,{contact_hold_steps}"
-    cmd_contact_with_pedal = f"SET_CONTACT_WITH_PEDAL,{contact_with_pedal}"
 
     log(f"{log_prefix}➡️ Syncing settings to ESP: {cmd_pulse}")
     esp_link.send_command(cmd_pulse)
@@ -419,9 +286,6 @@ def push_settings_to_esp(log_prefix: str = "") -> None:
 
     log(f"{log_prefix}➡️ Syncing contact hold to ESP: {cmd_contact}")
     esp_link.send_command(cmd_contact)
-
-    log(f"{log_prefix}➡️ Syncing contact+pedal behavior to ESP: {cmd_contact_with_pedal}")
-    esp_link.send_command(cmd_contact_with_pedal)
 
 
 # ========== ESP32 TCP LINK ==========
@@ -603,6 +467,61 @@ class ESP32Link:
 
         if line.startswith("STATUS,"):
             self._parse_status(line[7:])
+    def _receive_loop(self) -> None:
+        global esp_connected
+
+        buffer = ""
+
+        while self.running and self.connected:
+            try:
+                data = self.sock.recv(1024)  # type: ignore[union-attr]
+                if not data:
+                    log("⚠️ ESP32 connection closed (recv returned empty)")
+                    break
+
+                self.last_rx = time.time()
+                buffer += data.decode("utf-8", errors="ignore")
+
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        self._handle_line(line)
+
+            except socket.timeout:
+                now = time.time()
+
+                if (now - self.connected_at) < NO_TELEM_GRACE_S:
+                    continue
+
+                if (now - self.last_rx) > NO_TELEM_RECONNECT_S:
+                    log(f"⚠️ No telemetry for {NO_TELEM_RECONNECT_S:.0f}s; forcing reconnect")
+                    break
+
+            except Exception as e:
+                log(f"❌ Receive error: {e}")
+                break
+
+        log("🧹 Receive loop exiting, cleaning up connection...")
+        self.disconnect()
+        esp_connected = False
+        emit_status_update({"esp_connected": False})
+
+    def _handle_line(self, line: str) -> None:
+        global esp_connected
+
+        # Drop noisy keepalives / spammy heartbeats
+        if line in ("TICK_1S", "PING", "PONG"):
+            return
+
+        log(f"📥 Received: {line}")
+
+        if not esp_connected:
+            esp_connected = True
+            emit_status_update({"esp_connected": True})
+
+        if line.startswith("STATUS,"):
+            self._parse_status(line[7:])
         elif line.startswith("CELLS,"):
             self._parse_cells(line[6:])
         elif line.startswith("STATUS2,"):
@@ -649,14 +568,6 @@ class ESP32Link:
             if "vcap" in status and "vpack" not in status and "vpack" not in last_status:
                 status["vpack"] = status["vcap"]
 
-            # Runtime-only state bucket: updated immediately, never persisted.
-            update_live_runtime_state(status)
-
-            # Persistable bucket: learn defaults from authoritative ESP STATUS.
-            learned = learn_persistable_settings_from_status(status)
-            if learned:
-                log("🧠 Learned/persisting settings from authoritative STATUS")
-
             log(f"🧩 Parsed STATUS: {status}")
             last_status.update(status)
             emit_status_update({})
@@ -679,7 +590,6 @@ class ESP32Link:
                     except Exception:
                         pass
 
-            update_live_runtime_state(cells)
             last_status.update(cells)
             emit_status_update({})
 
@@ -694,7 +604,6 @@ class ESP32Link:
                 current = float(val)
                 last_status["current"] = current
                 last_status["i"] = current
-                update_live_runtime_state({"current": current, "i": current})
                 emit_status_update({})
         except Exception as e:
             log(f"⚠️ Failed to parse CHARGER: {e}")
@@ -714,72 +623,64 @@ class ESP32Link:
                     except Exception:
                         parsed[key] = val
 
-            # Charger-enable flag can arrive as chg_en (STATUS2) and/or charger_on (STATUS).
-            # Resolve robustly so telemetry isn't accidentally clamped during active charging.
-            chg_en = 0
-            for raw_flag in (
-                parsed.get("chg_en"),
-                parsed.get("charger_on"),
-                last_status.get("charger_on"),
-                last_status.get("chg_en"),
-            ):
-                if raw_flag is None:
-                    continue
-                try:
-                    chg_en = 1 if int(float(raw_flag)) == 1 else 0
-                    break
-                except Exception:
-                    continue
-
-            # Keep aliases in sync for downstream consumers.
-            parsed["chg_en"] = chg_en
-            parsed["charger_on"] = chg_en
-
-            # STATUS2 charge telemetry must be gated by charger enable.
-            if chg_en == 0:
-                for charge_key in ("charge_a", "ichg"):
-                    if charge_key in parsed:
-                        parsed[charge_key] = 0.0
-                # Reset deadband memory when charger is off to avoid stale-hold behavior.
-                self.last_vpack_emitted = None
-            else:
-                # Charger is on: preserve actual current readings (no extra clamping).
-                # Deadband filter for pack-voltage display smoothing.
-                if "vpack" in parsed:
+            # Suppress tiny phantom charger-current noise from INA226 telemetry.
+            # Keep this narrow so real charging current still shows up promptly.
+            for charge_key in ("charge_a", "ichg"):
+                if charge_key in parsed:
                     try:
-                        new_vpack = float(parsed["vpack"])
-
-                        if self.last_vpack_emitted is None:
-                            self.last_vpack_emitted = new_vpack
-                        elif abs(new_vpack - self.last_vpack_emitted) <= STATUS2_VPACK_DEADBAND_V:
-                            parsed["vpack"] = self.last_vpack_emitted
-                        else:
-                            self.last_vpack_emitted = new_vpack
+                        charge_current = float(parsed[charge_key])
+                        if abs(charge_current) < STATUS2_CHARGE_NOISE_THRESHOLD_A:
+                            parsed[charge_key] = 0.0
                     except Exception:
+                        # Non-numeric value; leave untouched.
                         pass
 
-            # Charge-current alias alignment.
-            if "ichg" in parsed and "charge_a" not in parsed:
-                parsed["charge_a"] = parsed["ichg"]
-            elif "charge_a" in parsed and "ichg" not in parsed:
-                parsed["ichg"] = parsed["charge_a"]
+            # Deadband filter for pack-voltage display smoothing.
+            # Keep STATUS2 update cadence unchanged; only clamp tiny vpack moves.
+            if "vpack" in parsed:
+                try:
+                    new_vpack = float(parsed["vpack"])
+
+                    if self.last_vpack_emitted is None:
+                        # First sample always passes through.
+                        self.last_vpack_emitted = new_vpack
+                    elif abs(new_vpack - self.last_vpack_emitted) <= STATUS2_VPACK_DEADBAND_V:
+                        # Within deadband: hold last emitted value to suppress twitching.
+                        parsed["vpack"] = self.last_vpack_emitted
+                    else:
+                        # Meaningful voltage movement: allow update.
+                        self.last_vpack_emitted = new_vpack
+                except Exception:
+                    # Non-numeric value; leave untouched.
+                    pass
 
             # Dialect alignment aliases for older/newer frontend keys.
+            # STM32 emits: cell1/cell2/cell3 (and optionally cell4 in some builds).
+            # Keep both naming styles to avoid breaking any UI variant.
             cell_aliases = {
                 "cell1": ("cell_1", "C1"),
                 "cell2": ("cell_2", "C2"),
                 "cell3": ("cell_3", "C3"),
+                "cell4": ("cell_4", "C4"),
             }
             for src_key, alias_keys in cell_aliases.items():
                 if src_key in parsed:
                     for alias_key in alias_keys:
                         parsed[alias_key] = parsed[src_key]
 
+            if any(k in parsed for k in ("cell1", "cell2", "cell3", "cell4")):
+                log(
+                    "🧩 STATUS2 cell mapping: "
+                    f"cell1={parsed.get('cell1')}→{parsed.get('cell_1')}, "
+                    f"cell2={parsed.get('cell2')}→{parsed.get('cell_2')}, "
+                    f"cell3={parsed.get('cell3')}→{parsed.get('cell_3')}, "
+                    f"cell4={parsed.get('cell4')}→{parsed.get('cell_4')}"
+                )
+
             # If vpack is not available for any reason, fall back to vcap if present.
             if "vpack" not in parsed and "vcap" in last_status:
                 parsed["vpack"] = last_status["vcap"]
 
-            update_live_runtime_state(parsed)
             log(f"🧩 Parsed STATUS2: {parsed}")
             last_status.update(parsed)
             emit_status_update({})
@@ -789,47 +690,122 @@ class ESP32Link:
             log(f"⚠️ Failed to parse STATUS2: {e}")
 
     def _parse_waveform(self, data: str) -> None:
-        """Parse WAVEFORM,count,i1,v1,i2,v2,... and emit waveform_data."""
+        """Parse WAVEFORM payloads and emit waveform_data.
+
+        Supported wire formats:
+        1) WAVEFORM,count,current1,voltage1,current2,voltage2,...
+        2) WAVEFORM,count,t_start_us,voltage1,current1,voltage2,current2,...
+        3) WAVEFORM,count,t1_us,voltage1,current1,t2_us,voltage2,current2,...
+        """
         try:
             parts = data.split(",")
-            if len(parts) < 2:
-                log(f"⚠️ WAVEFORM malformed (too short): {data}")
+            if len(parts) < 3 or parts[0] != "WAVEFORM":
+                log(f"⚠️ WAVEFORM malformed: {data}")
                 return
 
             expected_count = int(parts[1])
+            if expected_count <= 0:
+                log(f"⚠️ WAVEFORM invalid count: {expected_count}")
+                return
+
+            raw = parts[2:]
             samples = []
 
-            # Parse flattened current/voltage pairs.
-            for i in range(expected_count):
-                idx = 2 + (i * 2)
-                if idx + 1 < len(parts):
-                    try:
-                        current = float(parts[idx])
-                        voltage = float(parts[idx + 1])
+            def _f(v: str):
+                try:
+                    return float(v)
+                except Exception:
+                    return None
+
+            # Format 3: per-sample timestamps (triplets)
+            if len(raw) >= expected_count * 3:
+                ts_probe = []
+                probe_n = min(expected_count, 6)
+                for i in range(probe_n):
+                    t = _f(raw[i * 3])
+                    if t is None:
+                        ts_probe = []
+                        break
+                    ts_probe.append(t)
+
+                is_monotonic_ts = bool(ts_probe) and all(
+                    ts_probe[i] <= ts_probe[i + 1] for i in range(len(ts_probe) - 1)
+                )
+
+                if is_monotonic_ts:
+                    t0_us = _f(raw[0])
+                    if t0_us is None:
+                        t0_us = 0.0
+
+                    for i in range(expected_count):
+                        base = i * 3
+                        if base + 2 >= len(raw):
+                            break
+                        t_us = _f(raw[base])
+                        voltage = _f(raw[base + 1])
+                        current = _f(raw[base + 2])
+                        if t_us is None or voltage is None or current is None:
+                            continue
                         samples.append({
                             "current": current,
                             "voltage": voltage,
                             "index": i,
+                            "time_ms": max(0.0, (t_us - t0_us) / 1000.0),
                         })
-                    except Exception:
+
+            # Format 2: one start timestamp, then v/i pairs
+            if not samples and len(raw) >= (expected_count * 2 + 1):
+                t_start_us = _f(raw[0])
+                if t_start_us is not None:
+                    for i in range(expected_count):
+                        base = 1 + (i * 2)
+                        if base + 1 >= len(raw):
+                            break
+                        voltage = _f(raw[base])
+                        current = _f(raw[base + 1])
+                        if voltage is None or current is None:
+                            continue
+                        samples.append({
+                            "current": current,
+                            "voltage": voltage,
+                            "index": i,
+                            "time_ms": (t_start_us / 1000.0) + (i * 0.2),
+                        })
+
+            # Format 1: current/voltage pairs (no timestamps)
+            if not samples:
+                for i in range(expected_count):
+                    base = i * 2
+                    if base + 1 >= len(raw):
+                        break
+                    current = _f(raw[base])
+                    voltage = _f(raw[base + 1])
+                    if current is None or voltage is None:
                         continue
+                    samples.append({
+                        "current": current,
+                        "voltage": voltage,
+                        "index": i,
+                    })
 
-            # Map samples to weld time so final sample lands exactly at duration.
-            # Fence-post fix: N samples have (N-1) intervals.
-            sample_count = len(samples)
-            duration_ms = float(last_status.get("pulse_ms", 0.0) or 0.0)
-            if sample_count > 0 and last_weld_duration_ms > 0:
-                duration_ms = float(last_weld_duration_ms)
+                # Rebuild time axis from weld duration (fence-post safe).
+                sample_count = len(samples)
+                duration_ms = float(last_status.get("pulse_ms", 0.0) or 0.0)
+                if sample_count > 0 and last_weld_duration_ms > 0:
+                    duration_ms = float(last_weld_duration_ms)
 
-            dt_ms = duration_ms / (sample_count - 1) if sample_count > 1 else 0.0
-            for i, sample in enumerate(samples):
-                sample["time_ms"] = i * dt_ms
+                dt_ms = duration_ms / (sample_count - 1) if sample_count > 1 else 0.0
+                for i, sample in enumerate(samples):
+                    sample["time_ms"] = i * dt_ms
 
             payload = {
                 "samples": samples,
-                "count": expected_count,
+                "count": len(samples),
+                "expected_count": expected_count,
             }
-            log(f"🧩 Parsed WAVEFORM: expected={expected_count}, parsed={len(samples)}, duration_ms={duration_ms:.3f}, dt_ms={dt_ms:.6f}")
+            log(
+                f"🧩 Parsed WAVEFORM: expected={expected_count}, parsed={len(samples)}"
+            )
             socketio.emit("waveform_data", payload)
             log("📤 Emitting event: waveform_data")
 
@@ -862,15 +838,15 @@ class ESP32Link:
                 v_tips = float(parsed.get("v_tips", 0.0))
                 last_weld_duration_ms = total_ms
 
-                # Prefer physically-correct weld energy using tip voltage.
-                # E = V * I * t, with t in seconds.
-                if v_tips > 0 and total_ms > 0:
-                    joules = v_tips * avg_a * (total_ms / 1000.0)
-                elif "energy_j" in parsed:
-                    # Fall back to STM32-provided energy if available.
+                # Use STM32-provided energy directly when available.
+                # This avoids host-side recomputation mismatch (e.g. 2x when using pack voltage).
+                if "energy_j" in parsed:
                     joules = float(parsed.get("energy_j", 0.0))
+                elif v_tips > 0 and total_ms > 0:
+                    # Legacy fallback if firmware omits energy_j but provides tip voltage.
+                    joules = v_tips * avg_a * (total_ms / 1000.0)
                 else:
-                    # Legacy fallback if older firmware does not provide v_tips/energy_j.
+                    # Last-resort legacy estimate using capacitor voltage.
                     joules = ((vcap_b + vcap_a) * avg_a * total_ms / 2000.0)
 
                 voltage_drop = float(parsed.get("delta_v", vcap_b - vcap_a))
@@ -933,7 +909,7 @@ def api_status():
 
 @app.route("/api/get_settings")
 def api_get_settings():
-    settings = current_settings or load_settings()
+    settings = load_settings()
     return jsonify({"status": "ok", "settings": settings})
 
 
@@ -950,12 +926,6 @@ def api_save_settings():
         data["trigger_mode"] = "pedal"
     if "contact_hold_steps" not in data:
         data["contact_hold_steps"] = 2
-    if "contact_with_pedal" not in data:
-        data["contact_with_pedal"] = True
-
-    data["trigger_mode"] = _normalize_trigger_mode(data.get("trigger_mode"))
-    data["contact_hold_steps"] = _normalize_contact_hold_steps(data.get("contact_hold_steps"))
-    data["contact_with_pedal"] = bool(data.get("contact_with_pedal", True))
 
     if not save_settings(data):
         return jsonify({"status": "error", "message": "Failed to save settings"}), 500
@@ -1095,10 +1065,9 @@ def handle_disconnect():
 
 
 def init_esp32_connection():
-    global esp_link, esp_connected, current_settings, persistable_settings_state
+    global esp_link, esp_connected, current_settings
 
     current_settings = load_settings()
-    persistable_settings_state = dict(current_settings)
     log("🔌 Starting ESP32 connection manager...")
 
     delay = RECONNECT_BASE_DELAY_S
@@ -1121,7 +1090,8 @@ def init_esp32_connection():
                 if esp_link.connect():
                     esp_connected = True
                     emit_status_update({"esp_connected": True})
-                    log("✅ TCP connected; waiting for authoritative STATUS from ESP32 (no auto-push)")
+                    log("✅ TCP connected; syncing saved settings to ESP...")
+                    push_settings_to_esp(log_prefix="[ESP CONNECT] ")
                     delay = RECONNECT_BASE_DELAY_S
                 else:
                     log(f"❌ Connection failed, retrying in {delay:.0f} seconds...")
