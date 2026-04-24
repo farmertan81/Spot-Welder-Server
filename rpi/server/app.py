@@ -22,11 +22,16 @@ PRESETS_FILE = "presets.json"
 LOG_FILE = "welder.log"
 
 CONNECT_TIMEOUT_S = 3.0
-RECV_TIMEOUT_S = 1.0
+RECV_TIMEOUT_S = 3.0
 NO_TELEM_GRACE_S = 12.0
 NO_TELEM_RECONNECT_S = 120.0
 RECONNECT_BASE_DELAY_S = 1.0
 RECONNECT_MAX_DELAY_S = 8.0
+
+# Large waveform lines can be several KB. Use larger recv chunks and guard
+# against unbounded growth if newline terminator is missing.
+SOCKET_RECV_CHUNK_BYTES = 4096
+MAX_RX_BUFFER_BYTES = 262144
 
 HEARTBEAT_INTERVAL_S = 5.0  # Send PING every 5 seconds to keep connection alive
 
@@ -45,6 +50,10 @@ LEAD_RESISTANCE_DEFAULT_MOHM = 1.87
 LEAD_RESISTANCE_MIN_MOHM = 0.10
 LEAD_RESISTANCE_MAX_MOHM = 10.00
 
+# Waveform display alignment constants (STM32 sample interval is 0.1ms/sample).
+WAVEFORM_SAMPLE_INTERVAL_MS = 0.1
+DEFAULT_PULSE_START_SAMPLE = 10
+
 # ========== FLASK SETUP ==========
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "spot-welder-secret-2024"
@@ -57,6 +66,7 @@ last_status = {}
 current_settings = {}
 _esp_manager_started = False
 last_weld_duration_ms = 0.0
+last_weld_meta = {}
 
 
 # ========== LOGGING ==========
@@ -338,6 +348,9 @@ class ESP32Link:
         self._hb_greenlet = None
         self._rx_greenlet = None
 
+        # Chunked waveform assembly state (WAVEFORM_START/DATA/END).
+        self._reset_chunked_waveform_state()
+
     def connect(self) -> bool:
         try:
             self.running = True
@@ -451,7 +464,7 @@ class ESP32Link:
 
         while self.running and self.connected:
             try:
-                data = self.sock.recv(1024)  # type: ignore[union-attr]
+                data = self.sock.recv(SOCKET_RECV_CHUNK_BYTES)  # type: ignore[union-attr]
                 if not data:
                     log("⚠️ ESP32 connection closed (recv returned empty)")
                     break
@@ -506,13 +519,20 @@ class ESP32Link:
 
         while self.running and self.connected:
             try:
-                data = self.sock.recv(1024)  # type: ignore[union-attr]
+                data = self.sock.recv(SOCKET_RECV_CHUNK_BYTES)  # type: ignore[union-attr]
                 if not data:
                     log("⚠️ ESP32 connection closed (recv returned empty)")
                     break
 
                 self.last_rx = time.time()
                 buffer += data.decode("utf-8", errors="ignore")
+
+                if len(buffer) > MAX_RX_BUFFER_BYTES:
+                    log(
+                        "⚠️ RX buffer exceeded limit without newline; "
+                        f"trimming to last {MAX_RX_BUFFER_BYTES} bytes"
+                    )
+                    buffer = buffer[-MAX_RX_BUFFER_BYTES:]
 
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
@@ -552,29 +572,54 @@ class ESP32Link:
             esp_connected = True
             emit_status_update({"esp_connected": True})
 
-        if line.startswith("STATUS,"):
-            self._parse_status(line[7:])
-        elif line.startswith("CELLS,"):
-            self._parse_cells(line[6:])
-        elif line.startswith("STATUS2,"):
-            self._parse_status2(line[8:])
-        elif line.startswith("WAVEFORM,"):
-            self._parse_waveform(line)
-        elif line.startswith("EVENT,"):
-            self._parse_event(line[6:])
-        elif line.startswith("DENY,"):
-            reason = line[5:]
-            log(f"🚫 DENY: {reason}")
-            socketio.emit("deny_event", {"reason": reason})
-        elif line.startswith("BOOT,"):
-            msg = line[5:]
-            log(f"🔄 STM32 BOOT: {msg}")
-            socketio.emit("boot_event", {"message": msg})
-        elif line.startswith("CHARGER:") or line.startswith("CHARGER,"):
-            payload = line.split(",", 1)[1] if "," in line else line.split(":", 1)[1]
-            self._parse_charger(payload)
-        else:
-            socketio.emit("esp32_message", {"message": line})
+        try:
+            if line.startswith("STATUS,"):
+                log("🧭 Routing packet -> _parse_status")
+                self._parse_status(line[7:])
+            elif line.startswith("CELLS,"):
+                log("🧭 Routing packet -> _parse_cells")
+                self._parse_cells(line[6:])
+            elif line.startswith("STATUS2,"):
+                log("🧭 Routing packet -> _parse_status2")
+                self._parse_status2(line[8:])
+            elif line.startswith("WAVEFORM_START,"):
+                log("🧭 Routing packet -> _parse_waveform_start")
+                self._parse_waveform_start(line)
+            elif line.startswith("WAVEFORM_DATA,"):
+                log("🧭 Routing packet -> _parse_waveform_data")
+                self._parse_waveform_data(line)
+            elif line == "WAVEFORM_END":
+                log("🧭 Routing packet -> _finalize_chunked_waveform")
+                self._finalize_chunked_waveform()
+            elif line.startswith("WAVEFORM,"):
+                # Backward compatibility: legacy single-line waveform payload.
+                # If chunked mode is active, keep chunked parser as source of truth.
+                log(f"📏 Legacy WAVEFORM line length={len(line)} chars")
+                if self.chunked_waveform_active:
+                    log("⚠️ Ignoring legacy WAVEFORM because chunked waveform assembly is active")
+                    return
+                log("🧭 Routing packet -> _parse_waveform (legacy)")
+                self._parse_waveform(line)
+            elif line.startswith("EVENT,"):
+                log("🧭 Routing packet -> _parse_event")
+                self._parse_event(line[6:])
+            elif line.startswith("DENY,"):
+                reason = line[5:]
+                log(f"🧭 Routing packet -> DENY handler ({reason})")
+                socketio.emit("deny_event", {"reason": reason})
+            elif line.startswith("BOOT,"):
+                msg = line[5:]
+                log(f"🧭 Routing packet -> BOOT handler ({msg})")
+                socketio.emit("boot_event", {"message": msg})
+            elif line.startswith("CHARGER:") or line.startswith("CHARGER,"):
+                payload = line.split(",", 1)[1] if "," in line else line.split(":", 1)[1]
+                log("🧭 Routing packet -> _parse_charger")
+                self._parse_charger(payload)
+            else:
+                log(f"⚠️ Unhandled packet type, forwarding raw to UI: {line}")
+                socketio.emit("esp32_message", {"message": line})
+        except Exception as e:
+            log(f"❌ Exception while routing line '{line}': {e}")
 
     def _parse_status(self, data: str) -> None:
         """Parse STATUS,<k=v,...> and emit merged status_update."""
@@ -721,6 +766,270 @@ class ESP32Link:
         except Exception as e:
             log(f"⚠️ Failed to parse STATUS2: {e}")
 
+    def _reset_chunked_waveform_state(self) -> None:
+        self.chunked_waveform_expected_count = 0
+        self.chunked_waveform_pulse_start = DEFAULT_PULSE_START_SAMPLE
+        self.chunked_waveform_pulse_end = DEFAULT_PULSE_START_SAMPLE
+        self.chunked_waveform_samples: dict[int, tuple[float, float]] = {}
+        self.chunked_waveform_expected_indices: set[int] = set()
+        self.chunked_waveform_received_chunks = 0
+        self.chunked_waveform_active = False
+
+    def run_waveform_parser_self_test(self) -> dict:
+        """Run a local chunk-assembly self-test and log every step."""
+        log("🧪 Starting waveform parser self-test")
+
+        try:
+            # Synthetic waveform: 8 samples in 2 chunks
+            test_samples = [
+                (100.0, 8.90),
+                (200.0, 8.89),
+                (300.0, 8.88),
+                (400.0, 8.87),
+                (500.0, 8.86),
+                (600.0, 8.85),
+                (700.0, 8.84),
+                (800.0, 8.83),
+            ]
+
+            self._parse_waveform_start("WAVEFORM_START,8,1,8")
+
+            chunk0_tokens = ["WAVEFORM_DATA", "0", "4"]
+            for c, v in test_samples[:4]:
+                chunk0_tokens.extend([f"{c}", f"{v}"])
+            self._parse_waveform_data(",".join(chunk0_tokens))
+
+            chunk1_tokens = ["WAVEFORM_DATA", "4", "4"]
+            for c, v in test_samples[4:]:
+                chunk1_tokens.extend([f"{c}", f"{v}"])
+            self._parse_waveform_data(",".join(chunk1_tokens))
+
+            # This will emit waveform_data through socketio and then reset parser state.
+            self._finalize_chunked_waveform()
+
+            result = {
+                "status": "ok",
+                "message": "Self-test executed; check logs for chunk assembly and emit trace",
+            }
+            log(f"✅ Waveform parser self-test complete: {result}")
+            return result
+
+        except Exception as e:
+            log(f"❌ Waveform parser self-test failed: {e}")
+            return {"status": "error", "message": str(e)}
+
+    def _parse_waveform_start(self, line: str) -> None:
+        log(f"🧪 _parse_waveform_start called with line: {line}")
+        try:
+            parts = line.split(",")
+            if len(parts) < 4:
+                log(f"⚠️ WAVEFORM_START malformed: {line}")
+                return
+
+            expected_count = int(parts[1])
+            pulse_start = int(parts[2])
+            pulse_end = int(parts[3])
+
+            if expected_count <= 0:
+                log(f"⚠️ WAVEFORM_START invalid sample count: {expected_count}")
+                return
+
+            # Recovery path: new start arrived before previous waveform finished.
+            if self.chunked_waveform_active:
+                prev_expected = self.chunked_waveform_expected_count
+                prev_received = len(self.chunked_waveform_samples)
+                prev_missing = max(0, prev_expected - prev_received)
+                log(
+                    "⚠️ New WAVEFORM_START arrived before previous waveform completed; "
+                    f"discarding previous assembly (expected={prev_expected}, "
+                    f"received={prev_received}, missing={prev_missing})"
+                )
+
+            self._reset_chunked_waveform_state()
+            self.chunked_waveform_expected_count = expected_count
+            self.chunked_waveform_pulse_start = max(0, min(pulse_start, expected_count - 1))
+            self.chunked_waveform_pulse_end = max(self.chunked_waveform_pulse_start, min(pulse_end, expected_count))
+            self.chunked_waveform_expected_indices = set(range(expected_count))
+            self.chunked_waveform_active = True
+
+            log(
+                "📥 WAVEFORM_START received: "
+                f"{expected_count} samples (pulse_start={self.chunked_waveform_pulse_start}, "
+                f"pulse_end={self.chunked_waveform_pulse_end})"
+            )
+
+        except Exception as e:
+            log(f"⚠️ Failed to parse WAVEFORM_START: {e}")
+
+    def _parse_waveform_data(self, line: str) -> None:
+        log(f"🧪 _parse_waveform_data called with line prefix: {line[:120]}")
+        try:
+            if not self.chunked_waveform_active:
+                log("⚠️ WAVEFORM_DATA received without active WAVEFORM_START; dropping chunk")
+                return
+
+            parts = line.split(",")
+            if len(parts) < 3:
+                log(f"⚠️ WAVEFORM_DATA malformed: {line}")
+                return
+
+            start_idx = int(parts[1])
+            count = int(parts[2])
+            raw = parts[3:]
+
+            if start_idx < 0 or count <= 0:
+                log(f"⚠️ WAVEFORM_DATA invalid header: start={start_idx}, count={count}")
+                return
+
+            expected_tokens = count * 2
+            if len(raw) < expected_tokens:
+                log(
+                    "⚠️ WAVEFORM_DATA token count short: "
+                    f"start={start_idx}, count={count}, expected_tokens={expected_tokens}, got={len(raw)}"
+                )
+
+            parsed_in_chunk = 0
+            overwritten = 0
+            first_idx = start_idx
+            last_idx = start_idx - 1
+
+            for i in range(count):
+                token_idx = i * 2
+                if token_idx + 1 >= len(raw):
+                    break
+
+                sample_idx = start_idx + i
+                if sample_idx >= self.chunked_waveform_expected_count:
+                    log(
+                        "⚠️ WAVEFORM_DATA sample index out of range: "
+                        f"idx={sample_idx}, expected_count={self.chunked_waveform_expected_count}"
+                    )
+                    continue
+
+                try:
+                    current = float(raw[token_idx])
+                    voltage = float(raw[token_idx + 1])
+                except Exception as token_err:
+                    log(
+                        "⚠️ WAVEFORM_DATA non-numeric sample token: "
+                        f"sample_idx={sample_idx}, token_pair=({raw[token_idx]}, {raw[token_idx + 1]}), err={token_err}"
+                    )
+                    continue
+
+                if sample_idx in self.chunked_waveform_samples:
+                    overwritten += 1
+
+                self.chunked_waveform_samples[sample_idx] = (current, voltage)
+                parsed_in_chunk += 1
+                last_idx = sample_idx
+
+            self.chunked_waveform_received_chunks += 1
+
+            received_total = len(self.chunked_waveform_samples)
+            expected_total = self.chunked_waveform_expected_count
+            missing_total = max(0, expected_total - received_total)
+
+            if parsed_in_chunk < count:
+                log(
+                    "⚠️ WAVEFORM_DATA sample truncation detected: "
+                    f"start={start_idx}, expected={count}, parsed={parsed_in_chunk}, "
+                    f"missing={count - parsed_in_chunk}"
+                )
+
+            log(
+                "📥 WAVEFORM_DATA chunk "
+                f"{first_idx}-{last_idx} ({parsed_in_chunk} samples, declared={count}, overwritten={overwritten})"
+            )
+            log(
+                "📊 Assembly progress: "
+                f"received={received_total}/{expected_total} samples, "
+                f"chunks={self.chunked_waveform_received_chunks}, missing={missing_total}"
+            )
+
+        except Exception as e:
+            log(f"⚠️ Failed to parse WAVEFORM_DATA: {e}")
+
+    def _finalize_chunked_waveform(self) -> None:
+        log("🧪 _finalize_chunked_waveform called")
+        try:
+            if not self.chunked_waveform_active:
+                log("⚠️ WAVEFORM_END received without active WAVEFORM_START")
+                return
+
+            expected = self.chunked_waveform_expected_count
+            log(f"📥 WAVEFORM_END received: expected_total_samples={expected}")
+
+            received_indices = set(self.chunked_waveform_samples.keys())
+            missing_indices = sorted(self.chunked_waveform_expected_indices - received_indices)
+
+            if missing_indices:
+                preview = ",".join(str(v) for v in missing_indices[:20])
+                if len(missing_indices) > 20:
+                    preview += ",..."
+                log(
+                    "⚠️ WAVEFORM chunk validation failed: "
+                    f"expected={expected}, received={len(received_indices)}, "
+                    f"missing_count={len(missing_indices)}, missing_idx=[{preview}]"
+                )
+
+            samples = []
+            for i in range(expected):
+                pair = self.chunked_waveform_samples.get(i)
+                if pair is None:
+                    continue
+                current, voltage = pair
+                samples.append({
+                    "current": current,
+                    "voltage": voltage,
+                    "index": i,
+                    "time_ms": (i - self.chunked_waveform_pulse_start) * WAVEFORM_SAMPLE_INTERVAL_MS,
+                })
+
+            if samples:
+                log(
+                    "🧪 Sample preview before emit: "
+                    f"first={samples[0]}, mid={samples[len(samples)//2]}, last={samples[-1]}"
+                )
+            else:
+                log("⚠️ No samples assembled before emit")
+
+            wf_samples = expected
+            pulse_start_sample = self.chunked_waveform_pulse_start
+            if pulse_start_sample < 0 or pulse_start_sample >= wf_samples:
+                pulse_start_sample = 0
+            axis_max_time_ms = ((wf_samples - pulse_start_sample) - 1) * WAVEFORM_SAMPLE_INTERVAL_MS
+
+            payload = {
+                "samples": samples,
+                "count": len(samples),
+                "expected_count": expected,
+                "meta": {
+                    "wf_samples": wf_samples,
+                    "pulse_start_sample": pulse_start_sample,
+                    "pulse_end_sample": self.chunked_waveform_pulse_end,
+                    "axis_max_time_ms": axis_max_time_ms,
+                    "sample_interval_ms": WAVEFORM_SAMPLE_INTERVAL_MS,
+                    "chunked": True,
+                    "received_chunks": self.chunked_waveform_received_chunks,
+                    "missing_samples": len(missing_indices),
+                },
+            }
+
+            log(
+                "🧩 Parsed chunked WAVEFORM: "
+                f"expected={expected}, parsed={len(samples)}, "
+                f"chunks={self.chunked_waveform_received_chunks}, missing={len(missing_indices)}"
+            )
+            log(f"📤 Emitting waveform_data with count={payload['count']} expected={payload['expected_count']}")
+            socketio.emit("waveform_data", payload)
+            log(f"✅ WAVEFORM complete! Emitting {len(samples)} samples to UI")
+
+        except Exception as e:
+            log(f"⚠️ Error finalizing chunked waveform: {e}")
+        finally:
+            self._reset_chunked_waveform_state()
+            log("🧹 Chunked waveform state reset")
+
     def _parse_waveform(self, data: str) -> None:
         """Parse WAVEFORM payloads and emit waveform_data.
 
@@ -729,7 +1038,11 @@ class ESP32Link:
         2) WAVEFORM,count,t_start_us,voltage1,current1,voltage2,current2,...
         3) WAVEFORM,count,t1_us,voltage1,current1,t2_us,voltage2,current2,...
         """
+        global last_weld_meta
         try:
+            # Legacy single-line waveform cancels any partial chunked assembly.
+            self._reset_chunked_waveform_state()
+
             parts = data.split(",")
             if len(parts) < 3 or parts[0] != "WAVEFORM":
                 log(f"⚠️ WAVEFORM malformed: {data}")
@@ -741,6 +1054,7 @@ class ESP32Link:
                 return
 
             raw = parts[2:]
+            raw_tokens = len(raw)
             samples = []
 
             def _f(v: str):
@@ -801,7 +1115,7 @@ class ESP32Link:
                             "current": current,
                             "voltage": voltage,
                             "index": i,
-                            "time_ms": (t_start_us / 1000.0) + (i * 0.2),
+                            "time_ms": (t_start_us / 1000.0) + (i * WAVEFORM_SAMPLE_INTERVAL_MS),
                         })
 
             # Format 1: current/voltage pairs (no timestamps)
@@ -820,23 +1134,77 @@ class ESP32Link:
                         "index": i,
                     })
 
-                # Rebuild time axis from weld duration (fence-post safe).
+                # Rebuild time axis from sample index, aligned to pulse start sample.
+                # This preserves the full capture window and puts t=0 at
+                # pulse_start_sample.
                 sample_count = len(samples)
-                duration_ms = float(last_status.get("pulse_ms", 0.0) or 0.0)
-                if sample_count > 0 and last_weld_duration_ms > 0:
-                    duration_ms = float(last_weld_duration_ms)
+                pulse_start = int(last_weld_meta.get("pulse_start_sample", DEFAULT_PULSE_START_SAMPLE))
 
-                dt_ms = duration_ms / (sample_count - 1) if sample_count > 1 else 0.0
+                if pulse_start < 0:
+                    pulse_start = 0
+                elif sample_count > 0 and pulse_start >= sample_count:
+                    pulse_start = 0
+
                 for i, sample in enumerate(samples):
-                    sample["time_ms"] = i * dt_ms
+                    sample["time_ms"] = (i - pulse_start) * WAVEFORM_SAMPLE_INTERVAL_MS
+
+            # Build timing metadata for frontend X-axis scaling.
+            # Prefer STM32-reported wf_samples from WELD_DONE so dynamic pulse
+            # durations (e.g. 220 samples for 20ms pulse) render full time range.
+            wf_samples_raw = last_weld_meta.get("wf_samples", expected_count)
+            pulse_start_raw = last_weld_meta.get("pulse_start_sample", DEFAULT_PULSE_START_SAMPLE)
+
+            try:
+                wf_samples = int(wf_samples_raw)
+            except Exception:
+                wf_samples = expected_count
+
+            try:
+                pulse_start_sample = int(pulse_start_raw)
+            except Exception:
+                pulse_start_sample = DEFAULT_PULSE_START_SAMPLE
+
+            if wf_samples <= 0:
+                wf_samples = max(expected_count, len(samples))
+
+            if pulse_start_sample < 0:
+                pulse_start_sample = 0
+            elif pulse_start_sample >= wf_samples:
+                pulse_start_sample = 0
+
+            axis_max_time_ms = ((wf_samples - pulse_start_sample) - 1) * WAVEFORM_SAMPLE_INTERVAL_MS
 
             payload = {
                 "samples": samples,
                 "count": len(samples),
                 "expected_count": expected_count,
+                "meta": {
+                    "wf_samples": wf_samples,
+                    "pulse_start_sample": pulse_start_sample,
+                    "axis_max_time_ms": axis_max_time_ms,
+                    "sample_interval_ms": WAVEFORM_SAMPLE_INTERVAL_MS,
+                },
             }
+            parsed_count = len(samples)
+            min_expected_tokens = expected_count * 2
+            if raw_tokens < min_expected_tokens:
+                log(
+                    "⚠️ WAVEFORM token count short: "
+                    f"expected_tokens>={min_expected_tokens}, got={raw_tokens}"
+                )
+
+            if parsed_count < expected_count:
+                log(
+                    "⚠️ WAVEFORM sample truncation detected: "
+                    f"expected={expected_count}, parsed={parsed_count}, "
+                    f"missing={expected_count - parsed_count}"
+                )
+
             log(
-                f"🧩 Parsed WAVEFORM: expected={expected_count}, parsed={len(samples)}"
+                "🧩 Parsed WAVEFORM: "
+                f"expected={expected_count}, parsed={parsed_count}, "
+                f"raw_tokens={raw_tokens}, wf_samples={wf_samples}, "
+                f"pulse_start={pulse_start_sample}, x_max={axis_max_time_ms:.2f}ms"
             )
             socketio.emit("waveform_data", payload)
             log("📤 Emitting event: waveform_data")
@@ -845,7 +1213,7 @@ class ESP32Link:
             log(f"⚠️ Error parsing waveform: {e}")
 
     def _parse_event(self, event: str) -> None:
-        global last_weld_duration_ms
+        global last_weld_duration_ms, last_weld_meta
         if event == "WELD_START":
             socketio.emit("weld_event", {"message": "WELD_START", "active": True})
             log("📤 Emitting event: weld_event (WELD_START)")
@@ -869,6 +1237,7 @@ class ESP32Link:
                 total_ms = float(parsed.get("total_ms", 0.0))
                 v_tips = float(parsed.get("v_tips", 0.0))
                 last_weld_duration_ms = total_ms
+                last_weld_meta = parsed.copy()
 
                 # Use STM32-provided energy directly when available.
                 # This avoids host-side recomputation mismatch (e.g. 2x when using pack voltage).
@@ -937,6 +1306,19 @@ def logs():
 @app.route("/api/status")
 def api_status():
     return jsonify({"status": "ok", "esp_connected": esp_connected, "data": last_status})
+
+
+@app.route("/api/debug_waveform_parser", methods=["POST"])
+def api_debug_waveform_parser():
+    """Manual debug endpoint for chunked waveform assembly logic."""
+    global esp_link
+
+    if esp_link is None:
+        return jsonify({"status": "error", "message": "ESP link not initialized"}), 503
+
+    result = esp_link.run_waveform_parser_self_test()
+    code = 200 if result.get("status") == "ok" else 500
+    return jsonify(result), code
 
 
 @app.route("/api/get_settings")

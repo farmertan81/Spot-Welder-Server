@@ -705,6 +705,31 @@
         let liveTriggerMode = 'pedal';
         let liveContactHoldSteps = 2;
 
+        function normalizeTriggerMode(modeValue) {
+            if (modeValue === null || modeValue === undefined) return 'pedal';
+
+            if (typeof modeValue === 'string') {
+                const normalized = modeValue.trim().toLowerCase();
+                if (normalized === 'contact' || normalized === 'probe' || normalized === 'probe_contact') {
+                    return 'contact';
+                }
+                if (normalized === 'pedal' || normalized === 'manual') {
+                    return 'pedal';
+                }
+                if (normalized === '0') return 'contact';
+                if (normalized === '1' || normalized === '2') return 'pedal';
+            }
+
+            const numeric = Number(modeValue);
+            if (Number.isFinite(numeric)) {
+                // STM32 status enums (observed): 0=probe contact, 1=manual, 2=pedal.
+                // UI has two buckets: contact-triggered vs pedal/manual-triggered.
+                return numeric === 0 ? 'contact' : 'pedal';
+            }
+
+            return 'pedal';
+        }
+
         function syncSlider(sliderId, inputId, valueId, suffix = '') {
             const slider = document.getElementById(sliderId);
             const input = document.getElementById(inputId);
@@ -760,6 +785,7 @@
         }
 
         function setTriggerMode(mode) {
+            mode = normalizeTriggerMode(mode);
             document.getElementById('triggerMode').value = mode;
 
             document.querySelectorAll('#triggerModeBubbles .bubble-btn').forEach(btn => {
@@ -899,7 +925,7 @@
                     document.getElementById('preheatGapValue').textContent = s.preheat_gap_ms + ' ms';
                 }
 
-                setTriggerMode(s.trigger_mode || 'pedal');
+                setTriggerMode(normalizeTriggerMode(s.trigger_mode));
                 setContactHold(parseInt(s.contact_hold_steps || 2, 10));
 
                 if (s.lead_resistance_mohm !== undefined) {
@@ -1152,7 +1178,7 @@
             }
 
             if (data.trigger_mode !== undefined) {
-                liveTriggerMode = data.trigger_mode === 'contact' || data.trigger_mode === 1 ? 'contact' : 'pedal';
+                liveTriggerMode = normalizeTriggerMode(data.trigger_mode);
             }
 
             if (data.contact_hold_steps !== undefined) {

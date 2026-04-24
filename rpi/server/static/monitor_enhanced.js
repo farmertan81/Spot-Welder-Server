@@ -5,6 +5,8 @@
 const socket = io();
 let waveformChart = null;
 
+const DEFAULT_SAMPLE_INTERVAL_MS = 0.1;
+
 // ── Connection status ────────────────────────────────────────
 socket.on('connect', function () {
     console.log('SocketIO connected');
@@ -139,8 +141,13 @@ socket.on('waveform_data', function (data) {
 
     const currentPts = [];
 
+    const meta = (data && typeof data.meta === 'object' && data.meta) ? data.meta : {};
+    const sampleIntervalMs = Number.isFinite(Number(meta.sample_interval_ms))
+        ? Number(meta.sample_interval_ms)
+        : DEFAULT_SAMPLE_INTERVAL_MS;
+
     samples.forEach(function (s, i) {
-        const t = Number.isFinite(Number(s.time_ms)) ? Number(s.time_ms) : i * 0.2;
+        const t = Number.isFinite(Number(s.time_ms)) ? Number(s.time_ms) : i * sampleIntervalMs;
         const c = Number(s.current);
         if (Number.isFinite(c)) currentPts.push({ x: t, y: c });
     });
@@ -148,7 +155,19 @@ socket.on('waveform_data', function (data) {
     if (currentPts.length === 0) { console.warn('No valid current points'); return; }
 
     const minT = currentPts[0].x;
-    const maxT = currentPts[currentPts.length - 1].x;
+    let maxT = currentPts[currentPts.length - 1].x;
+
+    // Use STM32 metadata (wf_samples + pulse_start_sample) for full X-axis span,
+    // even when waveform payload has fewer decoded points.
+    const wfSamples = Number(meta.wf_samples);
+    const pulseStartSample = Number(meta.pulse_start_sample);
+    if (Number.isFinite(wfSamples) && Number.isFinite(pulseStartSample) && wfSamples > pulseStartSample) {
+        const computedMax = ((wfSamples - pulseStartSample) - 1) * sampleIntervalMs;
+        if (Number.isFinite(computedMax)) {
+            maxT = Math.max(maxT, computedMax);
+        }
+    }
+
     waveformChart.options.scales.x.min = minT;
     waveformChart.options.scales.x.max = maxT;
 
