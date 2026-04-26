@@ -3,20 +3,26 @@ Flask + SocketIO server for ESP32 spot welder control
 Handles TCP connection, web UI, and real-time updates
 """
 
-import eventlet
-eventlet.monkey_patch()
-
 import os
 import json
 import time
 import socket
+import threading
+import uuid
+from collections import defaultdict, deque
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify
 from flask_socketio import SocketIO, emit
 
 # ========== CONFIGURATION ==========
-ESP32_IP = "192.168.1.77"
-ESP32_PORT = 8888
+# ESP32 target can be overridden at runtime:
+# 1) Environment variables: ESP32_IP / ESP32_PORT
+# 2) server/settings.json keys: esp32_ip / esp32_port
+DEFAULT_ESP32_IP = "192.168.1.77"
+DEFAULT_ESP32_PORT = 8888
+ESP32_IP = DEFAULT_ESP32_IP
+ESP32_PORT = DEFAULT_ESP32_PORT
+
 SETTINGS_FILE = "settings.json"
 PRESETS_FILE = "presets.json"
 LOG_FILE = "welder.log"
@@ -46,18 +52,22 @@ STATUS2_VPACK_DEADBAND_V = 0.08
 # If your ESP supports a "CELLS" command, keep True. Otherwise set False.
 REQUEST_CELLS_ON_CONNECT = True
 
+# Settings save/ACK robustness tuning
+SETTINGS_ACK_TIMEOUT_S = 0.7
+SETTINGS_ACK_RETRIES = 1
+
 LEAD_RESISTANCE_DEFAULT_MOHM = 1.87
 LEAD_RESISTANCE_MIN_MOHM = 0.10
 LEAD_RESISTANCE_MAX_MOHM = 10.00
 
-# Waveform display alignment constants (STM32 sample interval is 0.1ms/sample).
+# Waveform fallback sample interval (used when payload has no explicit timestamps).
 WAVEFORM_SAMPLE_INTERVAL_MS = 0.1
 DEFAULT_PULSE_START_SAMPLE = 10
 
 # ========== FLASK SETUP ==========
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "spot-welder-secret-2024"
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 # ========== GLOBAL STATE ==========
 esp_link = None
@@ -67,6 +77,10 @@ current_settings = {}
 _esp_manager_started = False
 last_weld_duration_ms = 0.0
 last_weld_meta = {}
+
+# ACK wait/notify bridge for reliable command application.
+_ack_lock = threading.Lock()
+_ack_waiters: dict[str, deque] = defaultdict(deque)
 
 
 # ========== LOGGING ==========
@@ -79,6 +93,48 @@ def log(msg: str) -> None:
             f.write(log_line + "\n")
     except Exception as e:
         print(f"⚠️ Failed to write log: {e}")
+
+
+def load_runtime_config() -> tuple[str, int]:
+    """Resolve ESP32 target IP/port from env or settings file."""
+    ip = DEFAULT_ESP32_IP
+    port = DEFAULT_ESP32_PORT
+
+    # Optional server/settings.json overrides (kept in same file for easy editing).
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                cfg = json.load(f)
+            if isinstance(cfg, dict):
+                file_ip = str(cfg.get("esp32_ip", "")).strip()
+                if file_ip:
+                    ip = file_ip
+
+                if "esp32_port" in cfg:
+                    try:
+                        port = int(cfg.get("esp32_port", port))
+                    except Exception:
+                        pass
+        except Exception as e:
+            log(f"⚠️ Failed to parse {SETTINGS_FILE} for esp32 config: {e}")
+
+    # Environment variables take highest precedence.
+    env_ip = os.getenv("ESP32_IP", "").strip()
+    if env_ip:
+        ip = env_ip
+
+    env_port = os.getenv("ESP32_PORT", "").strip()
+    if env_port:
+        try:
+            port = int(env_port)
+        except Exception:
+            log(f"⚠️ Invalid ESP32_PORT env override: {env_port!r}; keeping {port}")
+
+    if port <= 0 or port > 65535:
+        log(f"⚠️ Invalid ESP32 port {port}; falling back to {DEFAULT_ESP32_PORT}")
+        port = DEFAULT_ESP32_PORT
+
+    return ip, port
 
 
 def _normalize_lead_resistance_mohm(value) -> float:
@@ -110,6 +166,204 @@ def emit_status_update(patch: dict | None = None) -> None:
         socketio.emit("status_update", payload)
     except Exception as e:
         log(f"⚠️ emit_status_update failed: {e}")
+
+
+def _coerce_scalar(raw: str):
+    raw = raw.strip()
+    if raw == "":
+        return raw
+    try:
+        if any(ch in raw for ch in (".", "e", "E")):
+            return float(raw)
+        return int(raw)
+    except Exception:
+        return raw
+
+
+def _parse_ack_line(line: str) -> dict | None:
+    """Parse ACK lines into structured payload for UI + waiter matching."""
+    if not line.startswith("ACK,"):
+        return None
+
+    parts = [p.strip() for p in line.split(",") if p.strip()]
+    if len(parts) < 2:
+        return None
+
+    command = parts[1]
+    fields = {}
+    raw_values = []
+
+    for token in parts[2:]:
+        if "=" in token:
+            key, value = token.split("=", 1)
+            fields[key.strip()] = _coerce_scalar(value)
+        else:
+            raw_values.append(_coerce_scalar(token))
+
+    payload = {
+        "raw": line,
+        "command": command,
+        "fields": fields,
+        "raw_values": raw_values,
+        "timestamp_ms": int(time.time() * 1000),
+    }
+
+    # Friendly fallback for ACK,ARM,1 / ACK,READY,0 styles.
+    if raw_values:
+        payload["value"] = raw_values[0]
+
+    return payload
+
+
+def _register_ack_waiter(command: str):
+    event = threading.Event()
+    waiter = {"event": event, "payload": None}
+    with _ack_lock:
+        _ack_waiters[command].append(waiter)
+    return waiter
+
+
+def _notify_ack_waiters(payload: dict) -> None:
+    command = str(payload.get("command", "")).strip()
+    if not command:
+        return
+
+    with _ack_lock:
+        queue = _ack_waiters.get(command)
+        if not queue:
+            return
+        waiter = queue.popleft()
+        if not queue:
+            _ack_waiters.pop(command, None)
+
+    waiter["payload"] = payload
+    waiter["event"].set()
+
+
+def _send_command_with_ack(cmd: str, ack_command: str, timeout_s: float = SETTINGS_ACK_TIMEOUT_S,
+                           retries: int = SETTINGS_ACK_RETRIES) -> dict:
+    """Send command and wait for matching ACK, with one retry for resilience."""
+    global esp_link
+
+    attempts = 0
+    while attempts <= retries:
+        attempts += 1
+
+        if not (esp_link and esp_link.connected):
+            return {
+                "ok": False,
+                "ack": None,
+                "attempts": attempts,
+                "error": "ESP32 not connected",
+            }
+
+        waiter = _register_ack_waiter(ack_command)
+        sent = esp_link.send_command(cmd)
+        if not sent:
+            with _ack_lock:
+                queue = _ack_waiters.get(ack_command)
+                if queue and waiter in queue:
+                    queue.remove(waiter)
+                    if not queue:
+                        _ack_waiters.pop(ack_command, None)
+            continue
+
+        if waiter["event"].wait(timeout_s):
+            return {
+                "ok": True,
+                "ack": waiter.get("payload"),
+                "attempts": attempts,
+                "error": None,
+            }
+
+        # Timeout: remove stale waiter then retry.
+        with _ack_lock:
+            queue = _ack_waiters.get(ack_command)
+            if queue and waiter in queue:
+                queue.remove(waiter)
+                if not queue:
+                    _ack_waiters.pop(ack_command, None)
+
+    return {
+        "ok": False,
+        "ack": None,
+        "attempts": attempts,
+        "error": f"ACK timeout for {ack_command}",
+    }
+
+
+def _normalize_trigger_mode_value(raw_mode) -> int:
+    s = str(raw_mode).strip().lower()
+    if s in ("contact", "probe", "probe_contact", "2", "0"):
+        return 2
+    return 1
+
+
+def _build_settings_command_plan(settings: dict) -> list[dict]:
+    """Build ordered STM32 command plan with ACK expectations."""
+    mode = int(settings.get("mode", 1))
+    d1 = int(settings.get("d1", 50))
+    gap1 = int(settings.get("gap1", 0))
+    d2 = int(settings.get("d2", 0))
+    gap2 = int(settings.get("gap2", 0))
+    d3 = int(settings.get("d3", 0))
+    power = int(settings.get("power", 100))
+
+    pre_en = 1 if bool(settings.get("preheat_enabled", False)) else 0
+    pre_ms = int(settings.get("preheat_duration", 20))
+    pre_pct = int(settings.get("preheat_power", 30))
+    pre_gap = int(settings.get("preheat_gap_ms", 3))
+
+    trigger_mode_num = _normalize_trigger_mode_value(settings.get("trigger_mode", "pedal"))
+
+    contact_hold_steps = int(settings.get("contact_hold_steps", 2))
+    if contact_hold_steps < 1:
+        contact_hold_steps = 1
+    if contact_hold_steps > 10:
+        contact_hold_steps = 10
+
+    lead_r_mohm = _normalize_lead_resistance_mohm(
+        settings.get("lead_resistance_mohm", LEAD_RESISTANCE_DEFAULT_MOHM)
+    )
+
+    return [
+        {
+            "name": "pulse",
+            "cmd": f"SET_PULSE,{mode},{d1},{gap1},{d2},{gap2},{d3}",
+            "ack": "SET_PULSE",
+            "fields": ["mode", "d1", "gap1", "d2", "gap2", "d3"],
+        },
+        {
+            "name": "power",
+            "cmd": f"SET_POWER,{power}",
+            "ack": "SET_POWER",
+            "fields": ["power"],
+        },
+        {
+            "name": "preheat",
+            "cmd": f"SET_PREHEAT,{pre_en},{pre_ms},{pre_pct},{pre_gap}",
+            "ack": "SET_PREHEAT",
+            "fields": ["preheat_enabled", "preheat_duration", "preheat_power", "preheat_gap_ms"],
+        },
+        {
+            "name": "trigger",
+            "cmd": f"SET_TRIGGER_MODE,{trigger_mode_num}",
+            "ack": "SET_TRIGGER_MODE",
+            "fields": ["trigger_mode"],
+        },
+        {
+            "name": "contact_hold",
+            "cmd": f"SET_CONTACT_HOLD,{contact_hold_steps}",
+            "ack": "SET_CONTACT_HOLD",
+            "fields": ["contact_hold_steps"],
+        },
+        {
+            "name": "lead_r",
+            "cmd": f"SET_LEAD_R,{lead_r_mohm:.3f}",
+            "ack": "LEAD_R",
+            "fields": ["lead_resistance_mohm"],
+        },
+    ]
 
 
 # ========== SETTINGS / PRESETS ==========
@@ -156,12 +410,100 @@ def load_settings() -> dict:
 
 def save_settings(settings: dict) -> bool:
     try:
+        # Preserve server runtime-config keys if UI payload does not include them.
+        preserved = {}
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE, "r") as f:
+                    existing = json.load(f)
+                if isinstance(existing, dict):
+                    for key in ("esp32_ip", "esp32_port"):
+                        if key in existing and key not in settings:
+                            preserved[key] = existing[key]
+            except Exception:
+                pass
+
+        payload = dict(settings)
+        payload.update(preserved)
+
         with open(SETTINGS_FILE, "w") as f:
-            json.dump(settings, f, indent=2)
+            json.dump(payload, f, indent=2)
         return True
     except Exception as e:
         log(f"⚠️ Failed to save settings: {e}")
         return False
+
+
+def settings_with_live_status(base_settings: dict) -> dict:
+    """
+    Merge runtime STATUS-derived settings into persisted settings.
+
+    STM32 runtime values are the source of truth when available, while file
+    settings remain fallback defaults before first STATUS arrives.
+    """
+    merged = dict(base_settings or {})
+
+    def _iget(key: str):
+        try:
+            return int(last_status[key])
+        except Exception:
+            return None
+
+    def _fget(key: str):
+        try:
+            return float(last_status[key])
+        except Exception:
+            return None
+
+    mode = _iget("mode")
+    if mode is not None:
+        merged["mode"] = mode
+
+    for dst, src in (("d1", "d1"), ("gap1", "gap1"), ("d2", "d2"),
+                     ("gap2", "gap2"), ("d3", "d3")):
+        val = _iget(src)
+        if val is not None:
+            merged[dst] = val
+
+    power = _iget("power_pct")
+    if power is None:
+        power = _iget("power")
+    if power is not None:
+        merged["power"] = power
+
+    pre_en = _iget("preheat_en")
+    if pre_en is not None:
+        merged["preheat_enabled"] = (pre_en == 1)
+
+    pre_ms = _iget("preheat_ms")
+    if pre_ms is not None:
+        merged["preheat_duration"] = pre_ms
+
+    pre_pct = _iget("preheat_pct")
+    if pre_pct is not None:
+        merged["preheat_power"] = pre_pct
+
+    pre_gap = _iget("preheat_gap_ms")
+    if pre_gap is not None:
+        merged["preheat_gap_ms"] = pre_gap
+
+    trig = _iget("trigger_mode")
+    if trig is not None:
+        merged["trigger_mode"] = "contact" if trig == 2 else "pedal"
+
+    hold_steps = _iget("contact_hold_steps")
+    if hold_steps is not None:
+        merged["contact_hold_steps"] = hold_steps
+
+    lead_mohm = _fget("lead_r_mohm")
+    if lead_mohm is None:
+        lead_ohm = _fget("lead_r_ohm")
+        if lead_ohm is not None:
+            lead_mohm = lead_ohm * 1000.0
+    if lead_mohm is not None:
+        merged["lead_resistance_mohm"] = _normalize_lead_resistance_mohm(lead_mohm)
+
+    return merged
 
 
 def load_presets() -> dict:
@@ -270,64 +612,12 @@ def push_settings_to_esp(log_prefix: str = "") -> None:
         return
 
     s = current_settings or load_settings()
+    plan = _build_settings_command_plan(s)
 
-    mode = s.get("mode", 1)
-    d1 = s.get("d1", 50)
-    gap1 = s.get("gap1", 0)
-    d2 = s.get("d2", 0)
-    gap2 = s.get("gap2", 0)
-    d3 = s.get("d3", 0)
-    power = s.get("power", 100)
-
-    pre_en = 1 if s.get("preheat_enabled", False) else 0
-    pre_ms = s.get("preheat_duration", 20)
-    pre_pct = s.get("preheat_power", 30)
-    pre_gap = s.get("preheat_gap_ms", 3)
-
-    trigger_mode = str(s.get("trigger_mode", "pedal")).strip().lower()
-    lead_r_mohm = _normalize_lead_resistance_mohm(
-        s.get("lead_resistance_mohm", LEAD_RESISTANCE_DEFAULT_MOHM)
-    )
-
-    try:
-        contact_hold_steps = int(s.get("contact_hold_steps", 2))
-    except Exception:
-        contact_hold_steps = 2
-
-    if contact_hold_steps < 1:
-        contact_hold_steps = 1
-    if contact_hold_steps > 10:
-        contact_hold_steps = 10
-
-    # ESP protocol:
-    # 1 = pedal
-    # 2 = contact
-    trigger_mode_num = 2 if trigger_mode == "contact" else 1
-
-    cmd_pulse   = f"SET_PULSE,{mode},{d1},{gap1},{d2},{gap2},{d3}"
-    cmd_power   = f"SET_POWER,{power}"
-    cmd_pre     = f"SET_PREHEAT,{pre_en},{pre_ms},{pre_pct},{pre_gap}"
-    cmd_trigger = f"SET_TRIGGER_MODE,{trigger_mode_num}"
-    cmd_contact = f"SET_CONTACT_HOLD,{contact_hold_steps}"
-    cmd_lead_r = f"SET_LEAD_R,{lead_r_mohm:.3f}"
-
-    log(f"{log_prefix}➡️ Syncing settings to ESP: {cmd_pulse}")
-    esp_link.send_command(cmd_pulse)
-
-    log(f"{log_prefix}➡️ Syncing power to ESP: {cmd_power}")
-    esp_link.send_command(cmd_power)
-
-    log(f"{log_prefix}➡️ Syncing preheat to ESP: {cmd_pre}")
-    esp_link.send_command(cmd_pre)
-
-    log(f"{log_prefix}➡️ Syncing trigger mode to ESP: {cmd_trigger}")
-    esp_link.send_command(cmd_trigger)
-
-    log(f"{log_prefix}➡️ Syncing contact hold to ESP: {cmd_contact}")
-    esp_link.send_command(cmd_contact)
-
-    log(f"{log_prefix}➡️ Syncing lead resistance to ESP: {cmd_lead_r}")
-    esp_link.send_command(cmd_lead_r)
+    for item in plan:
+        cmd = item["cmd"]
+        log(f"{log_prefix}➡️ Syncing {item['name']} to ESP: {cmd}")
+        esp_link.send_command(cmd)
 
 
 # ========== ESP32 TCP LINK ==========
@@ -345,8 +635,8 @@ class ESP32Link:
         # Last pack voltage value that was allowed through deadband filtering.
         self.last_vpack_emitted: float | None = None
 
-        self._hb_greenlet = None
-        self._rx_greenlet = None
+        self._hb_thread: threading.Thread | None = None
+        self._rx_thread: threading.Thread | None = None
 
         # Chunked waveform assembly state (WAVEFORM_START/DATA/END).
         self._reset_chunked_waveform_state()
@@ -379,11 +669,13 @@ class ESP32Link:
 
             log(f"✅ Connected to ESP32 at {self.host}:{self.port}")
 
-            # Start RX loop
-            self._rx_greenlet = eventlet.spawn_n(self._receive_loop)
+            # Start RX loop in a dedicated daemon thread.
+            self._rx_thread = threading.Thread(target=self._receive_loop, daemon=True, name="esp32-rx")
+            self._rx_thread.start()
 
             # Heartbeat loop optional (disabled)
-            # self._hb_greenlet = eventlet.spawn_n(self._heartbeat_loop)
+            # self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True, name="esp32-heartbeat")
+            # self._hb_thread.start()
 
             # One-time snapshot request
             self.send_command("STATUS", log_send=False)
@@ -412,22 +704,11 @@ class ESP32Link:
         self.running = False
         self.connected = False
 
-        # Kill greenlets so we never have two loops alive
-        try:
-            if self._rx_greenlet is not None:
-                eventlet.kill(self._rx_greenlet)
-        except Exception:
-            pass
-        try:
-            if self._hb_greenlet is not None:
-                eventlet.kill(self._hb_greenlet)
-        except Exception:
-            pass
-
-        self._rx_greenlet = None
-        self._hb_greenlet = None
-
+        # Thread loops exit when running=False and socket is closed.
+        # We do not force-kill threads; they are daemonized and naturally unwind.
         self._close_sock()
+        self._rx_thread = None
+        self._hb_thread = None
 
         if was_connected:
             log("🔌 Disconnected from ESP32")
@@ -453,65 +734,10 @@ class ESP32Link:
 
     def _heartbeat_loop(self) -> None:
         while self.running and self.connected:
-            eventlet.sleep(HEARTBEAT_INTERVAL_S)
+            time.sleep(HEARTBEAT_INTERVAL_S)
             if self.connected:
                 self.send_command("PING", log_send=False)
 
-    def _receive_loop(self) -> None:
-        global esp_connected
-
-        buffer = ""
-
-        while self.running and self.connected:
-            try:
-                data = self.sock.recv(SOCKET_RECV_CHUNK_BYTES)  # type: ignore[union-attr]
-                if not data:
-                    log("⚠️ ESP32 connection closed (recv returned empty)")
-                    break
-
-                self.last_rx = time.time()
-                buffer += data.decode("utf-8", errors="ignore")
-
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if line:
-                        self._handle_line(line)
-
-            except socket.timeout:
-                now = time.time()
-
-                if (now - self.connected_at) < NO_TELEM_GRACE_S:
-                    continue
-
-                if (now - self.last_rx) > NO_TELEM_RECONNECT_S:
-                    log(f"⚠️ No telemetry for {NO_TELEM_RECONNECT_S:.0f}s; forcing reconnect")
-                    break
-
-            except Exception as e:
-                log(f"❌ Receive error: {e}")
-                break
-
-        log("🧹 Receive loop exiting, cleaning up connection...")
-        self.disconnect()
-        esp_connected = False
-        emit_status_update({"esp_connected": False})
-
-    def _handle_line(self, line: str) -> None:
-        global esp_connected
-
-        # Drop noisy keepalives / spammy heartbeats
-        if line in ("TICK_1S", "PING", "PONG"):
-            return
-
-        log(f"📥 Received: {line}")
-
-        if not esp_connected:
-            esp_connected = True
-            emit_status_update({"esp_connected": True})
-
-        if line.startswith("STATUS,"):
-            self._parse_status(line[7:])
     def _receive_loop(self) -> None:
         global esp_connected
 
@@ -615,6 +841,11 @@ class ESP32Link:
                 payload = line.split(",", 1)[1] if "," in line else line.split(":", 1)[1]
                 log("🧭 Routing packet -> _parse_charger")
                 self._parse_charger(payload)
+            elif line.startswith("ACK,"):
+                ack_payload = _parse_ack_line(line)
+                if ack_payload:
+                    socketio.emit("command_ack", ack_payload)
+                    _notify_ack_waiters(ack_payload)
             else:
                 log(f"⚠️ Unhandled packet type, forwarding raw to UI: {line}")
                 socketio.emit("esp32_message", {"message": line})
@@ -770,38 +1001,41 @@ class ESP32Link:
         self.chunked_waveform_expected_count = 0
         self.chunked_waveform_pulse_start = DEFAULT_PULSE_START_SAMPLE
         self.chunked_waveform_pulse_end = DEFAULT_PULSE_START_SAMPLE
-        self.chunked_waveform_samples: dict[int, tuple[float, float]] = {}
+        # sample tuple = (timestamp_us_or_none, current_amps, voltage_volts)
+        self.chunked_waveform_samples: dict[int, tuple[float | None, float, float]] = {}
         self.chunked_waveform_expected_indices: set[int] = set()
         self.chunked_waveform_received_chunks = 0
         self.chunked_waveform_active = False
+        self.chunked_waveform_format = "unknown"
+        self.chunked_waveform_has_timestamps = False
 
     def run_waveform_parser_self_test(self) -> dict:
         """Run a local chunk-assembly self-test and log every step."""
         log("🧪 Starting waveform parser self-test")
 
         try:
-            # Synthetic waveform: 8 samples in 2 chunks
+            # Synthetic waveform: 8 samples in 2 chunks (timestamp, voltage, current)
             test_samples = [
-                (100.0, 8.90),
-                (200.0, 8.89),
-                (300.0, 8.88),
-                (400.0, 8.87),
-                (500.0, 8.86),
-                (600.0, 8.85),
-                (700.0, 8.84),
-                (800.0, 8.83),
+                (0.0, 8.90, 100.0),
+                (100.0, 8.89, 200.0),
+                (200.0, 8.88, 300.0),
+                (300.0, 8.87, 400.0),
+                (400.0, 8.86, 500.0),
+                (500.0, 8.85, 600.0),
+                (600.0, 8.84, 700.0),
+                (700.0, 8.83, 800.0),
             ]
 
             self._parse_waveform_start("WAVEFORM_START,8,1,8")
 
             chunk0_tokens = ["WAVEFORM_DATA", "0", "4"]
-            for c, v in test_samples[:4]:
-                chunk0_tokens.extend([f"{c}", f"{v}"])
+            for t_us, v, c in test_samples[:4]:
+                chunk0_tokens.extend([f"{t_us}", f"{v}", f"{c}"])
             self._parse_waveform_data(",".join(chunk0_tokens))
 
             chunk1_tokens = ["WAVEFORM_DATA", "4", "4"]
-            for c, v in test_samples[4:]:
-                chunk1_tokens.extend([f"{c}", f"{v}"])
+            for t_us, v, c in test_samples[4:]:
+                chunk1_tokens.extend([f"{t_us}", f"{v}", f"{c}"])
             self._parse_waveform_data(",".join(chunk1_tokens))
 
             # This will emit waveform_data through socketio and then reset parser state.
@@ -881,11 +1115,19 @@ class ESP32Link:
                 log(f"⚠️ WAVEFORM_DATA invalid header: start={start_idx}, count={count}")
                 return
 
-            expected_tokens = count * 2
+            if self.chunked_waveform_format == "unknown":
+                if len(raw) >= (count * 3):
+                    self.chunked_waveform_format = "timestamp_tvi"
+                    self.chunked_waveform_has_timestamps = True
+                else:
+                    self.chunked_waveform_format = "legacy_vi"
+
+            tokens_per_sample = 3 if self.chunked_waveform_format == "timestamp_tvi" else 2
+            expected_tokens = count * tokens_per_sample
             if len(raw) < expected_tokens:
                 log(
                     "⚠️ WAVEFORM_DATA token count short: "
-                    f"start={start_idx}, count={count}, expected_tokens={expected_tokens}, got={len(raw)}"
+                    f"start={start_idx}, count={count}, expected_tokens={expected_tokens}, got={len(raw)}, format={self.chunked_waveform_format}"
                 )
 
             parsed_in_chunk = 0
@@ -894,8 +1136,8 @@ class ESP32Link:
             last_idx = start_idx - 1
 
             for i in range(count):
-                token_idx = i * 2
-                if token_idx + 1 >= len(raw):
+                token_idx = i * tokens_per_sample
+                if (token_idx + tokens_per_sample - 1) >= len(raw):
                     break
 
                 sample_idx = start_idx + i
@@ -906,20 +1148,28 @@ class ESP32Link:
                     )
                     continue
 
+                timestamp_us = None
+
                 try:
-                    current = float(raw[token_idx])
-                    voltage = float(raw[token_idx + 1])
+                    if tokens_per_sample == 3:
+                        timestamp_us = float(raw[token_idx])
+                        voltage = float(raw[token_idx + 1])
+                        current = float(raw[token_idx + 2])
+                    else:
+                        current = float(raw[token_idx])
+                        voltage = float(raw[token_idx + 1])
                 except Exception as token_err:
+                    bad_tokens = raw[token_idx:token_idx + tokens_per_sample]
                     log(
                         "⚠️ WAVEFORM_DATA non-numeric sample token: "
-                        f"sample_idx={sample_idx}, token_pair=({raw[token_idx]}, {raw[token_idx + 1]}), err={token_err}"
+                        f"sample_idx={sample_idx}, tokens={bad_tokens}, err={token_err}"
                     )
                     continue
 
                 if sample_idx in self.chunked_waveform_samples:
                     overwritten += 1
 
-                self.chunked_waveform_samples[sample_idx] = (current, voltage)
+                self.chunked_waveform_samples[sample_idx] = (timestamp_us, current, voltage)
                 parsed_in_chunk += 1
                 last_idx = sample_idx
 
@@ -938,7 +1188,7 @@ class ESP32Link:
 
             log(
                 "📥 WAVEFORM_DATA chunk "
-                f"{first_idx}-{last_idx} ({parsed_in_chunk} samples, declared={count}, overwritten={overwritten})"
+                f"{first_idx}-{last_idx} ({parsed_in_chunk} samples, declared={count}, overwritten={overwritten}, format={self.chunked_waveform_format})"
             )
             log(
                 "📊 Assembly progress: "
@@ -973,17 +1223,62 @@ class ESP32Link:
                 )
 
             samples = []
+            timestamp_count = 0
             for i in range(expected):
-                pair = self.chunked_waveform_samples.get(i)
-                if pair is None:
+                sample_tuple = self.chunked_waveform_samples.get(i)
+                if sample_tuple is None:
                     continue
-                current, voltage = pair
-                samples.append({
+
+                timestamp_us, current, voltage = sample_tuple
+                sample = {
                     "current": current,
                     "voltage": voltage,
                     "index": i,
-                    "time_ms": (i - self.chunked_waveform_pulse_start) * WAVEFORM_SAMPLE_INTERVAL_MS,
-                })
+                }
+
+                if timestamp_us is not None:
+                    sample["timestamp_us"] = timestamp_us
+                    timestamp_count += 1
+
+                samples.append(sample)
+
+            wf_samples = expected
+            pulse_start_sample = self.chunked_waveform_pulse_start
+            if pulse_start_sample < 0 or pulse_start_sample >= wf_samples:
+                pulse_start_sample = 0
+
+            derived_interval_ms = WAVEFORM_SAMPLE_INTERVAL_MS
+            time_source = "sample_index"
+
+            if timestamp_count > 0 and samples:
+                pulse_start_tuple = self.chunked_waveform_samples.get(pulse_start_sample)
+                pulse_start_time_us = None
+                if pulse_start_tuple and pulse_start_tuple[0] is not None:
+                    pulse_start_time_us = pulse_start_tuple[0]
+                else:
+                    pulse_start_time_us = samples[0].get("timestamp_us", 0.0)
+
+                previous_t_us = None
+                timestamp_deltas_us = []
+                for sample in samples:
+                    t_us = sample.get("timestamp_us")
+                    if t_us is None:
+                        sample["time_ms"] = (sample["index"] - pulse_start_sample) * WAVEFORM_SAMPLE_INTERVAL_MS
+                        continue
+
+                    sample["time_ms"] = (t_us - pulse_start_time_us) / 1000.0
+
+                    if previous_t_us is not None and t_us >= previous_t_us:
+                        timestamp_deltas_us.append(t_us - previous_t_us)
+                    previous_t_us = t_us
+
+                if timestamp_deltas_us:
+                    derived_interval_ms = (sum(timestamp_deltas_us) / len(timestamp_deltas_us)) / 1000.0
+
+                time_source = "timestamp_us"
+            else:
+                for sample in samples:
+                    sample["time_ms"] = (sample["index"] - pulse_start_sample) * WAVEFORM_SAMPLE_INTERVAL_MS
 
             if samples:
                 log(
@@ -993,11 +1288,10 @@ class ESP32Link:
             else:
                 log("⚠️ No samples assembled before emit")
 
-            wf_samples = expected
-            pulse_start_sample = self.chunked_waveform_pulse_start
-            if pulse_start_sample < 0 or pulse_start_sample >= wf_samples:
-                pulse_start_sample = 0
-            axis_max_time_ms = ((wf_samples - pulse_start_sample) - 1) * WAVEFORM_SAMPLE_INTERVAL_MS
+            sample_times = [float(s.get("time_ms", 0.0)) for s in samples if isinstance(s, dict)]
+            fallback_max = ((wf_samples - pulse_start_sample) - 1) * WAVEFORM_SAMPLE_INTERVAL_MS
+            axis_max_time_ms = max(sample_times) if sample_times else fallback_max
+            axis_min_time_ms = min(sample_times) if sample_times else 0.0
 
             payload = {
                 "samples": samples,
@@ -1007,9 +1301,12 @@ class ESP32Link:
                     "wf_samples": wf_samples,
                     "pulse_start_sample": pulse_start_sample,
                     "pulse_end_sample": self.chunked_waveform_pulse_end,
+                    "axis_min_time_ms": axis_min_time_ms,
                     "axis_max_time_ms": axis_max_time_ms,
-                    "sample_interval_ms": WAVEFORM_SAMPLE_INTERVAL_MS,
+                    "sample_interval_ms": derived_interval_ms,
+                    "time_source": time_source,
                     "chunked": True,
+                    "waveform_format": self.chunked_waveform_format,
                     "received_chunks": self.chunked_waveform_received_chunks,
                     "missing_samples": len(missing_indices),
                 },
@@ -1293,19 +1590,10 @@ def monitor():
     return render_template('monitor.html')
 
 
-@app.route("/logs")
-def logs():
-    try:
-        with open(LOG_FILE, "r") as f:
-            log_lines = f.readlines()[-100:]
-        return render_template("logs.html", logs=log_lines)
-    except Exception:
-        return render_template("logs.html", logs=[])
-
-
 @app.route("/api/status")
 def api_status():
-    return jsonify({"status": "ok", "esp_connected": esp_connected, "data": last_status})
+    payload = {**last_status, "status": "ok", "esp_connected": esp_connected, "data": last_status}
+    return jsonify(payload)
 
 
 @app.route("/api/debug_waveform_parser", methods=["POST"])
@@ -1323,7 +1611,9 @@ def api_debug_waveform_parser():
 
 @app.route("/api/get_settings")
 def api_get_settings():
-    settings = load_settings()
+    global current_settings
+    settings = settings_with_live_status(current_settings or load_settings())
+    current_settings = settings
     return jsonify({"status": "ok", "settings": settings})
 
 
@@ -1352,11 +1642,55 @@ def api_save_settings():
 
     current_settings = data
 
-    # Push immediately to ESP on save
-    if esp_link and esp_link.connected:
-        push_settings_to_esp(log_prefix="[SAVE] ")
+    tx_id = str(uuid.uuid4())
 
-    return jsonify({"status": "ok"})
+    # Persist success should still return to UI even when hardware is offline.
+    if not (esp_link and esp_link.connected):
+        return jsonify({
+            "status": "ok",
+            "tx_id": tx_id,
+            "offline": True,
+            "message": "Settings saved locally; ESP32 not connected",
+            "results": [],
+            "failed": [],
+        })
+
+    plan = _build_settings_command_plan(data)
+    results = []
+    failed = []
+
+    for item in plan:
+        result = _send_command_with_ack(item["cmd"], item["ack"])
+        ui_ack_payload = {
+            "tx_id": tx_id,
+            "command": item["ack"],
+            "target_fields": item["fields"],
+            "attempts": result.get("attempts", 0),
+            "ok": bool(result.get("ok")),
+            "error": result.get("error"),
+            "ack": result.get("ack"),
+        }
+
+        if result.get("ok"):
+            socketio.emit("command_ack", ui_ack_payload)
+            results.append(ui_ack_payload)
+        else:
+            failed.append(ui_ack_payload)
+            socketio.emit("command_ack", ui_ack_payload)
+
+    # Ask one STATUS snapshot after batch to converge quickly.
+    esp_link.send_command("STATUS", log_send=False)
+
+    if failed:
+        return jsonify({
+            "status": "partial",
+            "tx_id": tx_id,
+            "message": "Some settings were not acknowledged",
+            "results": results,
+            "failed": failed,
+        }), 207
+
+    return jsonify({"status": "ok", "tx_id": tx_id, "results": results, "failed": []})
 @app.route("/api/set_power", methods=["POST"])
 def api_set_power():
     global current_settings
@@ -1511,31 +1845,47 @@ def init_esp32_connection():
                 if esp_link.connect():
                     esp_connected = True
                     emit_status_update({"esp_connected": True})
-                    log("✅ TCP connected; syncing saved settings to ESP...")
-                    push_settings_to_esp(log_prefix="[ESP CONNECT] ")
+                    log("✅ TCP connected; waiting for live STATUS sync (STM32 runtime is source of truth)")
                     delay = RECONNECT_BASE_DELAY_S
                 else:
                     log(f"❌ Connection failed, retrying in {delay:.0f} seconds...")
-                    eventlet.sleep(delay)
+                    time.sleep(delay)
                     delay = min(RECONNECT_MAX_DELAY_S, delay * 2)
             else:
-                eventlet.sleep(1)
+                time.sleep(1)
 
         except Exception as e:
             log(f"❌ Connection manager error: {e}")
             esp_connected = False
             emit_status_update({"esp_connected": False})
-            eventlet.sleep(2)
+            time.sleep(2)
 
 
 if __name__ == "__main__":
+    ESP32_IP, ESP32_PORT = load_runtime_config()
 
     log("🚀 Starting Spot Welder Control Server")
     log(f"📡 ESP32 Target: {ESP32_IP}:{ESP32_PORT}")
+    log("🛠️ Override target via ESP32_IP/ESP32_PORT env vars or settings.json keys esp32_ip/esp32_port")
+
+    # PRODUCTION DEPLOYMENT:
+    # For low-traffic deployments, threaded gunicorn is simple and reliable:
+    #   gunicorn --bind 0.0.0.0:8080 --workers 1 --threads 4 app:app
+    #
+    # For higher concurrency, gevent is also supported:
+    #   gunicorn --bind 0.0.0.0:8080 --workers 1 --worker-class gevent app:app
 
     if not _esp_manager_started:
         _esp_manager_started = True
-        eventlet.spawn_n(init_esp32_connection)
+        threading.Thread(target=init_esp32_connection, daemon=True, name="esp32-manager").start()
 
     log("🌐 Starting web server on http://0.0.0.0:8080")
-    socketio.run(app, host="0.0.0.0", port=8080, debug=False, use_reloader=False)
+    socketio.run(
+        app,
+        host="0.0.0.0",
+        port=8080,
+        debug=False,
+        use_reloader=False,
+        allow_unsafe_werkzeug=True,
+    )
+

@@ -1,17 +1,17 @@
 {
   "mode": 1,
-  "d1": 10,
+  "d1": 50,
   "gap1": 1,
   "d2": 1,
   "gap2": 1,
   "d3": 1,
   "active_preset": null,
   "power": 100,
-  "preheat_enabled": false,
-  "preheat_duration": 20,
-  "preheat_power": 35,
-  "preheat_gap_ms": 1,
+  "preheat_enabled": true,
+  "preheat_duration": 25,
+  "preheat_power": 50,
+  "preheat_gap_ms": 3,
   "trigger_mode": "contact",
   "contact_hold_steps": 2,
-  "lead_resistance_mohm": 1.87
+  "lead_resistance_mohm": 2.0
 }

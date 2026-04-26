@@ -43,7 +43,9 @@ document.addEventListener('DOMContentLoaded', function () {
                     fill: true,
                     tension: 0.3,
                     borderWidth: 2.5,
-                    pointRadius: 0
+                    pointRadius: 0,
+                    pointHoverRadius: 0,
+                    pointHitRadius: 0
                 }
             ]
         },
@@ -55,6 +57,13 @@ document.addEventListener('DOMContentLoaded', function () {
             plugins: {
                 legend: { display: false },
                 tooltip: { enabled: true }
+            },
+            elements: {
+                point: {
+                    radius: 0,
+                    hoverRadius: 0,
+                    hitRadius: 0
+                }
             },
             scales: {
                 x: {
@@ -147,18 +156,34 @@ socket.on('waveform_data', function (data) {
         : DEFAULT_SAMPLE_INTERVAL_MS;
 
     samples.forEach(function (s, i) {
-        const t = Number.isFinite(Number(s.time_ms)) ? Number(s.time_ms) : i * sampleIntervalMs;
+        let t = NaN;
+
+        if (Number.isFinite(Number(s.t))) {
+            t = Number(s.t);
+        } else if (Number.isFinite(Number(s.time_ms))) {
+            t = Number(s.time_ms);
+        } else if (Number.isFinite(Number(s.timestamp_us))) {
+            t = Number(s.timestamp_us) / 1000.0;
+        } else {
+            t = i * sampleIntervalMs;
+        }
+
         const c = Number(s.current);
-        if (Number.isFinite(c)) currentPts.push({ x: t, y: c });
+        if (Number.isFinite(c) && Number.isFinite(t)) currentPts.push({ x: t, y: c });
     });
 
     if (currentPts.length === 0) { console.warn('No valid current points'); return; }
 
-    const minT = currentPts[0].x;
-    let maxT = currentPts[currentPts.length - 1].x;
+    const pointMinT = Math.min(...currentPts.map(p => p.x));
+    const pointMaxT = Math.max(...currentPts.map(p => p.x));
 
-    // Use STM32 metadata (wf_samples + pulse_start_sample) for full X-axis span,
-    // even when waveform payload has fewer decoded points.
+    const metaMinT = Number(meta.axis_min_time_ms);
+    const metaMaxT = Number(meta.axis_max_time_ms);
+
+    const minT = Number.isFinite(metaMinT) ? Math.min(pointMinT, metaMinT) : pointMinT;
+    let maxT = Number.isFinite(metaMaxT) ? Math.max(pointMaxT, metaMaxT) : pointMaxT;
+
+    // Backward-compatible fallback for legacy packets that only provide wf_samples.
     const wfSamples = Number(meta.wf_samples);
     const pulseStartSample = Number(meta.pulse_start_sample);
     if (Number.isFinite(wfSamples) && Number.isFinite(pulseStartSample) && wfSamples > pulseStartSample) {
@@ -167,7 +192,6 @@ socket.on('waveform_data', function (data) {
             maxT = Math.max(maxT, computedMax);
         }
     }
-
     waveformChart.options.scales.x.min = minT;
     waveformChart.options.scales.x.max = maxT;
 

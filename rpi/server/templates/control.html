@@ -40,6 +40,15 @@
             color: #ff6b35;
         }
 
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-left: auto;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+
         .nav-links {
             display: flex;
             gap: 12px;
@@ -143,7 +152,6 @@
             color: #ff6b35;
             text-shadow: 0 0 20px #ff6b35;
             opacity: 0;
-            pointer-events: none;
             transition: opacity 0.3s;
         }
 
@@ -253,16 +261,25 @@
         }
 
         .connection-status {
-            display: inline-block;
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            background: #f44336;
-            margin-left: 10px;
+            padding: 8px 14px;
+            border-radius: 999px;
+            font-size: 0.9em;
+            font-weight: 700;
+            border: 1px solid #666;
+            background: #333;
+            color: #ff8080;
         }
 
         .connection-status.connected {
-            background: #4CAF50;
+            color: #4CAF50;
+            border-color: #4CAF50;
+            background: rgba(76, 175, 80, 0.12);
+        }
+
+        .connection-status.disconnected {
+            color: #f44336;
+            border-color: #f44336;
+            background: rgba(244, 67, 54, 0.1);
         }
 
         .cell-balance {
@@ -430,6 +447,11 @@
                 flex-wrap: wrap;
             }
 
+            .header-right {
+                width: 100%;
+                justify-content: space-between;
+            }
+
             .nav-links {
                 width: 100%;
                 justify-content: flex-end;
@@ -459,25 +481,19 @@
                 🔴 DISARMED
             </button>
 
-            <div
-                style="background: #2a2a2a; padding: 10px 16px; border-radius: 8px; border: 2px solid #ff6b35; flex: 1;">
-                <div style="font-size: 0.85em; color: #aaa; margin-bottom: 5px;">🎯 READY TO FIRE:</div>
-                <div id="active-settings" style="font-size: 1em; color: #fff; font-weight: bold;">
-                    Loading...
+            <div class="header-right">
+                <div id="connectionStatus" class="connection-status disconnected">Disconnected</div>
+                <div class="nav-links">
+                    <a href="/">Control</a>
+                    <a href="/monitor">📊 Monitor</a>
                 </div>
-            </div>
-
-            <div class="nav-links">
-                <a href="/">Control</a>
-                <a href="/monitor">📊 Monitor</a>
-                <a href="/logs">Logs</a>
             </div>
         </header>
 
         <div class="grid">
             <div>
                 <div class="panel">
-                    <h2>Status <span class="connection-status" id="esp-status"></span></h2>
+                    <h2>Status</h2>
                     <div class="status-grid">
                         <div class="status-card">
                             <div class="card-title">Pack Voltage</div>
@@ -667,6 +683,16 @@
                                 onclick="setContactHold(4)">2.0s</button>
                             <button type="button" class="bubble-btn small" data-hold="5"
                                 onclick="setContactHold(5)">2.5s</button>
+                            <button type="button" class="bubble-btn small" data-hold="6"
+                                onclick="setContactHold(6)">3.0s</button>
+                            <button type="button" class="bubble-btn small" data-hold="7"
+                                onclick="setContactHold(7)">3.5s</button>
+                            <button type="button" class="bubble-btn small" data-hold="8"
+                                onclick="setContactHold(8)">4.0s</button>
+                            <button type="button" class="bubble-btn small" data-hold="9"
+                                onclick="setContactHold(9)">4.5s</button>
+                            <button type="button" class="bubble-btn small" data-hold="10"
+                                onclick="setContactHold(10)">5.0s</button>
                         </div>
                         <div class="inline-note">Used only when Trigger Source = Probe Contact.</div>
                     </div>
@@ -681,9 +707,12 @@
                         <div class="inline-note" id="leadResistanceLive">Current STM32: -- mΩ</div>
                     </div>
 
-                    <button class="btn btn-primary"
-                        style="width: 72px; margin-top: 8px; padding: 6px 10px; font-size: 0.85em;"
-                        onclick="saveSettings()">Save</button>
+                    <div style="display:flex; align-items:center; gap:10px; margin-top:8px;">
+                        <button class="btn btn-primary"
+                            style="width: 72px; padding: 6px 10px; font-size: 0.85em;"
+                            onclick="saveSettings()">Save</button>
+                        <span id="saveStatusText" class="inline-note" style="min-height: 18px;"></span>
+                    </div>
                 </div>
             </div>
         </div>
@@ -702,8 +731,123 @@
 
         let presets = {};
         let currentPreset = null;
-        let liveTriggerMode = 'pedal';
-        let liveContactHoldSteps = 2;
+
+        class SettingsManager {
+            constructor() {
+                this.pendingChanges = new Set();
+                // ONLY these immediate controls get protection
+                this.protectedFields = ['preheat_en', 'trigger_mode'];
+            }
+
+            markPending(fieldName, timeoutMs = 1500) {
+                // ONLY mark pending if it's a protected field
+                if (!this.protectedFields.includes(fieldName)) {
+                    return; // Don't protect numeric inputs!
+                }
+
+                this.pendingChanges.add(fieldName);
+                setTimeout(() => {
+                    this.pendingChanges.delete(fieldName);
+                }, timeoutMs);
+            }
+
+            isPending(fieldName) {
+                return this.pendingChanges.has(fieldName);
+            }
+
+            sendCommand(fieldName, value) {
+                this.markPending(fieldName);
+                saveSettings(true);
+                return value;
+            }
+        }
+
+        const settingsSync = new SettingsManager();
+
+        const sliderFieldMap = {
+            powerSlider: 'power_pct',
+            preheatDurationSlider: 'preheat_ms',
+            preheatPowerSlider: 'preheat_pct',
+            preheatGapSlider: 'preheat_gap_ms'
+        };
+
+        const sliderDragState = {
+            activeDrags: new Set(),
+
+            startDrag(sliderId) {
+                this.activeDrags.add(sliderId);
+                const slider = document.getElementById(sliderId);
+                if (slider) slider.style.outline = '2px solid #4DA3FF';
+                console.log('Started dragging:', sliderId);
+            },
+
+            endDrag(sliderId) {
+                setTimeout(() => {
+                    this.activeDrags.delete(sliderId);
+                    const slider = document.getElementById(sliderId);
+                    if (slider) slider.style.outline = '';
+                    console.log('Stopped dragging:', sliderId);
+                }, 500);
+            },
+
+            isDragging(sliderId) {
+                return this.activeDrags.has(sliderId);
+            }
+        };
+
+        function saveSliderValue(sliderId, value) {
+            const field = sliderFieldMap[sliderId];
+            console.log(`Saving ${sliderId} = ${value} (${field || 'unmapped'})`);
+            if (!field) return;
+
+            // Persist through the existing save pipeline used by this page.
+            saveSettings(true);
+        }
+
+        function attachSliderDragListeners() {
+            const sliders = Array.from(document.querySelectorAll('input[type="range"][id]'));
+
+            sliders.forEach((slider) => {
+                const sliderId = slider.id;
+
+                const handleDragStart = () => {
+                    sliderDragState.startDrag(sliderId);
+                };
+
+                const handleDragEnd = () => {
+                    const wasDragging = sliderDragState.isDragging(sliderId);
+                    sliderDragState.endDrag(sliderId);
+                    if (wasDragging) {
+                        saveSliderValue(sliderId, slider.value);
+                    }
+                };
+
+                slider.addEventListener('mousedown', handleDragStart);
+                slider.addEventListener('mouseup', handleDragEnd);
+                slider.addEventListener('mouseleave', handleDragEnd);
+
+                slider.addEventListener('touchstart', handleDragStart, { passive: true });
+                slider.addEventListener('touchend', handleDragEnd);
+                slider.addEventListener('touchcancel', handleDragEnd);
+            });
+        }
+
+        // Emergency debug: monitor values + pending state in real time
+        setInterval(() => {
+            const powerInput = document.getElementById('powerInput');
+            const preheatDuration = document.getElementById('preheatDuration');
+            console.log('Current values:');
+            console.log('Power:', powerInput ? powerInput.value : '(missing powerInput)');
+            console.log('Preheat ms:', preheatDuration ? preheatDuration.value : '(missing preheatDuration)');
+            console.log('Pending:', Array.from(settingsSync.pendingChanges));
+        }, 3000);
+
+        function setSaveStatus(message, color = '#9aa0b0') {
+            const el = document.getElementById('saveStatusText');
+            if (!el) return;
+            el.textContent = message;
+            el.style.color = color;
+        }
 
         function normalizeTriggerMode(modeValue) {
             if (modeValue === null || modeValue === undefined) return 'pedal';
@@ -716,15 +860,15 @@
                 if (normalized === 'pedal' || normalized === 'manual') {
                     return 'pedal';
                 }
-                if (normalized === '0') return 'contact';
-                if (normalized === '1' || normalized === '2') return 'pedal';
+                if (normalized === '0' || normalized === '2') return 'contact';
+                if (normalized === '1') return 'pedal';
             }
 
             const numeric = Number(modeValue);
             if (Number.isFinite(numeric)) {
-                // STM32 status enums (observed): 0=probe contact, 1=manual, 2=pedal.
-                // UI has two buckets: contact-triggered vs pedal/manual-triggered.
-                return numeric === 0 ? 'contact' : 'pedal';
+                // Trigger enum compatibility: 1=pedal (current), 2=contact (current),
+                // 0=contact (legacy).
+                return (numeric === 2 || numeric === 0) ? 'contact' : 'pedal';
             }
 
             return 'pedal';
@@ -784,7 +928,7 @@
             if (gap2Field) gap2Field.style.display = mode >= 3 ? 'block' : 'none';
         }
 
-        function setTriggerMode(mode) {
+        function setTriggerMode(mode, markPresetDirty = true) {
             mode = normalizeTriggerMode(mode);
             document.getElementById('triggerMode').value = mode;
 
@@ -805,26 +949,116 @@
                 holdRow.querySelectorAll('.bubble-btn').forEach(btn => btn.disabled = true);
             }
 
-            currentPreset = null;
-            document.querySelectorAll('.preset-btn').forEach(btn => btn.classList.remove('active'));
-            updateActiveSettings();
+            if (markPresetDirty) {
+                currentPreset = null;
+                document.querySelectorAll('.preset-btn').forEach(btn => btn.classList.remove('active'));
+                settingsSync.sendCommand('trigger_mode', mode === 'contact' ? 2 : 1);
+            }
         }
 
-        function setContactHold(steps) {
-            document.getElementById('contactHoldSteps').value = steps;
+        function setContactHold(steps, markPresetDirty = true) {
+            const clamped = Math.max(1, Math.min(10, parseInt(steps, 10) || 1));
+            document.getElementById('contactHoldSteps').value = clamped;
 
             document.querySelectorAll('#contactHoldBubbles .bubble-btn').forEach(btn => {
-                btn.classList.toggle('active', parseInt(btn.dataset.hold, 10) === steps);
+                btn.classList.toggle('active', parseInt(btn.dataset.hold, 10) === clamped);
             });
 
-            currentPreset = null;
-            document.querySelectorAll('.preset-btn').forEach(btn => btn.classList.remove('active'));
-            updateActiveSettings();
+            if (markPresetDirty) {
+                currentPreset = null;
+                document.querySelectorAll('.preset-btn').forEach(btn => btn.classList.remove('active'));
+            }
         }
 
-        function holdStepsToSecondsText(steps) {
-            const val = parseInt(steps, 10) || 0;
-            return (val * 0.5).toFixed(1) + 's';
+        function updatePreheatEnable(enabled) {
+            if (settingsSync.isPending('preheat_en')) {
+                return; // Keep pending protection ONLY for checkbox
+            }
+
+            const checked = Number(enabled) === 1 || enabled === true;
+            const checkbox = document.getElementById('preheatEnable');
+            const options = document.getElementById('preheatControls');
+            if (checkbox && document.activeElement !== checkbox) {
+                checkbox.checked = checked;
+            }
+            if (options) {
+                options.style.display = checked ? 'block' : 'none';
+            }
+        }
+
+        function updateTriggerMode(mode) {
+            if (settingsSync.isPending('trigger_mode')) {
+                return; // Keep pending protection ONLY for trigger mode
+            }
+            setTriggerMode(normalizeTriggerMode(mode), false);
+        }
+
+        function applyStatusSettings(data) {
+            if (!data || typeof data !== 'object') return;
+
+            const mode = Number(data.mode);
+            if (Number.isFinite(mode) && mode >= 1 && mode <= 3) {
+                const modeEl = document.getElementById('mode');
+                if (modeEl && document.activeElement !== modeEl) {
+                    modeEl.value = String(mode);
+                    modeEl.dispatchEvent(new Event('change'));
+                }
+            }
+
+            const pulseKeys = ['d1', 'gap1', 'd2', 'gap2', 'd3'];
+            pulseKeys.forEach((key) => {
+                const v = Number(data[key]);
+                const el = document.getElementById(key);
+                if (Number.isFinite(v) && el && document.activeElement !== el) {
+                    el.value = String(Math.round(v));
+                }
+            });
+
+            const power = Number(data.power_pct ?? data.power);
+            if (Number.isFinite(power)) {
+                const pIn = document.getElementById('powerInput');
+                const pSl = document.getElementById('powerSlider');
+                const pVal = document.getElementById('powerValue');
+                if (!sliderDragState.isDragging('powerSlider')) {
+                    if (pIn) pIn.value = String(Math.round(power));
+                    if (pSl) pSl.value = String(Math.round(power));
+                    if (pVal) pVal.textContent = `${Math.round(power)}%`;
+                }
+            }
+
+            const preheatEn = Number(data.preheat_en);
+            if (Number.isFinite(preheatEn)) {
+                updatePreheatEnable(preheatEn);
+            }
+
+            const mapPreheat = [
+                ['preheat_ms', 'preheatDuration', 'preheatDurationSlider', 'preheatDurationValue', ' ms'],
+                ['preheat_pct', 'preheatPower', 'preheatPowerSlider', 'preheatPowerValue', '%'],
+                ['preheat_gap_ms', 'preheatGap', 'preheatGapSlider', 'preheatGapValue', ' ms']
+            ];
+            mapPreheat.forEach(([src, inputId, sliderId, valueId, suffix]) => {
+                const v = Number(data[src]);
+                if (!Number.isFinite(v)) return;
+                if (sliderDragState.isDragging(sliderId)) return;
+
+                const rounded = Math.round(v);
+                const inputEl = document.getElementById(inputId);
+                const sliderEl = document.getElementById(sliderId);
+                const valueEl = document.getElementById(valueId);
+                if (inputEl) inputEl.value = String(rounded);
+                if (sliderEl) sliderEl.value = String(rounded);
+                if (valueEl) valueEl.textContent = `${rounded}${suffix}`;
+            });
+
+            const trigMode = data.trigger_mode;
+            if (trigMode !== undefined && trigMode !== null) {
+                updateTriggerMode(trigMode);
+            }
+
+            const holdSteps = Number(data.contact_hold_steps);
+            if (Number.isFinite(holdSteps) && holdSteps >= 1) {
+                setContactHold(Math.round(holdSteps), false);
+            }
         }
 
         function updateChargerCurrent(data) {
@@ -838,49 +1072,6 @@
             const active = Math.abs(amps) > 0.01;
             chargerEl.classList.toggle('charger-active', active);
             chargerEl.classList.toggle('charger-idle', !active);
-        }
-
-        function updateActiveSettings() {
-            const mode = parseInt(document.getElementById('mode').value, 10);
-            const d1 = document.getElementById('d1').value;
-            const gap1 = document.getElementById('gap1').value;
-            const d2 = document.getElementById('d2').value;
-            const gap2 = document.getElementById('gap2').value;
-            const d3 = document.getElementById('d3').value;
-            const power = document.getElementById('powerInput').value;
-
-            const preheatEn = document.getElementById('preheatEnable').checked;
-            const preheatMs = document.getElementById('preheatDuration').value;
-            const preheatPct = document.getElementById('preheatPower').value;
-            const preheatGap = document.getElementById('preheatGap').value;
-
-            const triggerMode = document.getElementById('triggerMode').value;
-            const contactHoldSteps = document.getElementById('contactHoldSteps').value;
-            const leadResistance = parseFloat(document.getElementById('leadResistance').value || '1.87');
-
-            let modeText = '';
-            let pulseText = '';
-
-            if (mode === 1) {
-                modeText = 'Single';
-                pulseText = `P1: ${d1}ms`;
-            } else if (mode === 2) {
-                modeText = 'Double';
-                pulseText = `P1: ${d1}ms | Gap: ${gap1}ms | P2: ${d2}ms`;
-            } else if (mode === 3) {
-                modeText = 'Triple';
-                pulseText = `P1: ${d1}ms | Gap: ${gap1}ms | P2: ${d2}ms | Gap: ${gap2}ms | P3: ${d3}ms`;
-            }
-
-            let preheatText = preheatEn ? ` | 🔥Pre: ${preheatMs}ms@${preheatPct}% gap=${preheatGap}ms` : '';
-            let triggerText = triggerMode === 'contact'
-                ? ` | 🎯Probe Contact (${holdStepsToSecondsText(contactHoldSteps)})`
-                : ' | 🎯Pedal';
-
-            const leadText = Number.isFinite(leadResistance) ? ` | 🔌Lead ${leadResistance.toFixed(2)}mΩ` : '';
-            const display = `${modeText} | ${pulseText} | ⚡${power}%${preheatText}${triggerText}${leadText}`;
-            const el = document.getElementById('active-settings');
-            if (el) el.textContent = display;
         }
 
         async function loadSettings() {
@@ -925,8 +1116,8 @@
                     document.getElementById('preheatGapValue').textContent = s.preheat_gap_ms + ' ms';
                 }
 
-                setTriggerMode(normalizeTriggerMode(s.trigger_mode));
-                setContactHold(parseInt(s.contact_hold_steps || 2, 10));
+                setTriggerMode(normalizeTriggerMode(s.trigger_mode), false);
+                setContactHold(parseInt(s.contact_hold_steps || 2, 10), false);
 
                 if (s.lead_resistance_mohm !== undefined) {
                     const leadEl = document.getElementById('leadResistance');
@@ -934,19 +1125,16 @@
                 }
 
                 document.getElementById('mode').dispatchEvent(new Event('change'));
-                updateActiveSettings();
 
                 const st = await fetch('/api/status').then(r => r.json());
-                if (st.esp_connected) {
-                    await saveSettings(true);
-                } else {
-                    console.log('ESP not connected yet; not auto-applying');
+                if (st && typeof st === 'object') {
+                    applyStatusSettings(st.data || st);
                 }
             }
         }
 
-        async function saveSettings(silent = false) {
-            const settings = {
+        function collectSettingsPayload() {
+            return {
                 mode: parseInt(document.getElementById('mode').value, 10),
                 d1: parseInt(document.getElementById('d1').value, 10),
                 gap1: parseInt(document.getElementById('gap1').value, 10),
@@ -955,30 +1143,53 @@
                 d3: parseInt(document.getElementById('d3').value, 10),
                 active_preset: currentPreset,
                 power: parseInt(document.getElementById('powerInput').value, 10),
-
                 preheat_enabled: document.getElementById('preheatEnable').checked,
                 preheat_duration: parseInt(document.getElementById('preheatDuration').value, 10),
                 preheat_power: parseInt(document.getElementById('preheatPower').value, 10),
                 preheat_gap_ms: parseInt(document.getElementById('preheatGap').value, 10),
-
                 trigger_mode: document.getElementById('triggerMode').value,
                 contact_hold_steps: parseInt(document.getElementById('contactHoldSteps').value, 10),
                 lead_resistance_mohm: parseFloat(document.getElementById('leadResistance').value)
             };
+        }
 
-            const resp = await fetch('/api/save_settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(settings)
-            });
+        async function saveSettings(silent = false) {
+            const payload = collectSettingsPayload();
 
-            if (!resp.ok) {
-                if (!silent) alert('❌ Failed to save settings!');
-                return;
+            if (!silent) setSaveStatus('Saving…', '#ffae42');
+
+            try {
+                const resp = await fetch('/api/save_settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                let body = {};
+                try {
+                    body = await resp.json();
+                } catch (_) {
+                    body = {};
+                }
+
+                if ((body?.status === 'ok' && resp.ok) || resp.ok) {
+                    if (!silent) {
+                        setSaveStatus('Settings saved ✓', '#4CAF50');
+                        setTimeout(() => setSaveStatus(''), 1200);
+                    }
+                    return;
+                }
+
+                if (body?.status === 'partial' || resp.status === 207) {
+                    if (!silent) setSaveStatus('Partial apply – check ACKs', '#ffcc00');
+                    return;
+                }
+
+                if (!silent) setSaveStatus('Save failed', '#ff4d4f');
+            } catch (err) {
+                console.error('saveSettings error:', err);
+                if (!silent) setSaveStatus('Save failed', '#ff4d4f');
             }
-
-            updateActiveSettings();
-            if (!silent) alert('✅ Settings saved!');
         }
 
         async function loadPresets() {
@@ -1000,7 +1211,6 @@
                     currentPreset = savedPreset;
                     const btn = document.querySelector('.preset-btn[onclick*="' + savedPreset + '"]');
                     if (btn) btn.classList.add('active');
-                    updateActiveSettings();
                 }
             }
         }
@@ -1052,7 +1262,6 @@
             const btn = document.querySelector('.preset-btn[onclick*="' + presetId + '"]');
             if (btn) btn.classList.add('active');
 
-            updateActiveSettings();
             await saveSettings(true);
         }
 
@@ -1096,36 +1305,18 @@
         }
 
         let isArmed = false;
+        let armClickPending = false;
+        let armClickTimeout = null;
 
-        function toggleArmUI() {
-            isArmed = !isArmed;
-            const button = document.getElementById('armButton');
-            if (!button) return;
-
-            if (isArmed) {
-                fetch('/api/arm', { method: 'POST' })
-                    .then(r => r.json())
-                    .then(data => {
-                        if (data.status === 'ok') {
-                            button.innerHTML = '🟢 ARMED';
-                            button.style.borderColor = '#44ff44';
-                            button.style.color = '#44ff44';
-                            button.style.background = '#1a3a1a';
-                            button.style.boxShadow = '0 4px 12px rgba(68,255,68,0.4)';
-                        }
-                    });
+        function setConnectionIndicator(espConnected) {
+            const statusEl = document.getElementById('connectionStatus');
+            if (!statusEl) return;
+            if (espConnected) {
+                statusEl.textContent = 'Connected';
+                statusEl.className = 'connection-status connected';
             } else {
-                fetch('/api/disarm', { method: 'POST' })
-                    .then(r => r.json())
-                    .then(data => {
-                        if (data.status === 'ok') {
-                            button.innerHTML = '🔴 DISARMED';
-                            button.style.borderColor = '#ff4444';
-                            button.style.color = '#ff4444';
-                            button.style.background = '#2a2a2a';
-                            button.style.boxShadow = '0 4px 8px rgba(0,0,0,0.5)';
-                        }
-                    });
+                statusEl.textContent = 'Disconnected';
+                statusEl.className = 'connection-status disconnected';
             }
         }
 
@@ -1136,18 +1327,47 @@
             if (!button) return;
 
             if (isArmed) {
-                button.textContent = '🟢 ARMED (Click to Disarm)';
-                button.classList.add('armed');
-                button.classList.remove('disarmed');
+                button.textContent = '🟢 ARMED';
+                button.style.borderColor = '#44ff44';
+                button.style.color = '#44ff44';
+                button.style.background = '#1a3a1a';
+                button.style.boxShadow = '0 4px 12px rgba(68,255,68,0.4)';
             } else {
-                button.textContent = '🔴 DISARMED (Click to Arm)';
-                button.classList.add('disarmed');
-                button.classList.remove('armed');
+                button.textContent = '🔴 DISARMED';
+                button.style.borderColor = '#ff4444';
+                button.style.color = '#ff4444';
+                button.style.background = '#2a2a2a';
+                button.style.boxShadow = '0 4px 8px rgba(0,0,0,0.5)';
             }
+        }
+
+        function toggleArmUI() {
+            const targetArmed = !isArmed;
+            armClickPending = true;
+            updateArmStateUI(targetArmed);
+
+            clearTimeout(armClickTimeout);
+            armClickTimeout = setTimeout(() => {
+                armClickPending = false;
+            }, 500);
+
+            fetch(targetArmed ? '/api/arm' : '/api/disarm', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status !== 'ok') {
+                        armClickPending = false;
+                        updateArmStateUI(!targetArmed);
+                    }
+                })
+                .catch(() => {
+                    armClickPending = false;
+                    updateArmStateUI(!targetArmed);
+                });
         }
 
         socket.on('status_update', (data) => {
             console.log('📊 Status Update:', data);
+            console.log('STATUS received, active drags:', Array.from(sliderDragState.activeDrags));
 
             if (typeof data.vpack === 'number') {
                 document.getElementById('vpack').textContent = data.vpack.toFixed(2) + ' V';
@@ -1170,20 +1390,14 @@
             if (typeof data.C3 === 'number') document.getElementById('c3').textContent = data.C3.toFixed(2) + 'V';
 
             if ('esp_connected' in data) {
-                document.getElementById('esp-status').classList.toggle('connected', !!data.esp_connected);
+                setConnectionIndicator(!!data.esp_connected);
             }
 
-            if ('enabled' in data) {
+            if ('enabled' in data && !armClickPending) {
                 updateArmStateUI(data.enabled);
             }
 
-            if (data.trigger_mode !== undefined) {
-                liveTriggerMode = normalizeTriggerMode(data.trigger_mode);
-            }
-
-            if (data.contact_hold_steps !== undefined) {
-                liveContactHoldSteps = parseInt(data.contact_hold_steps, 10) || 2;
-            }
+            applyStatusSettings(data);
 
             let leadMohm = null;
             if (typeof data.lead_r_mohm === 'number') {
@@ -1202,50 +1416,30 @@
 
             updateChargerCurrent(data);
 
-            if (data.mode !== undefined) {
-                const mode = parseInt(data.mode, 10);
-                const d1 = data.d1 || data.pulse_ms || 0;
-                const gap1 = data.gap1 || data.gap_ms || 0;
-                const d2 = data.d2 || data.pulse2_ms || 0;
-                const gap2 = data.gap2 || data.gap2_ms || 0;
-                const d3 = data.d3 || data.pulse3_ms || 0;
-                const power = data.power_pct || 100;
+        });
 
-                const preheatEn = !!data.preheat_en;
-                const preheatMs = data.preheat_ms || 0;
-                const preheatPct = data.preheat_pct || 0;
-                const preheatGap = data.preheat_gap_ms || 0;
-
-                let modeText = '';
-                let pulseText = '';
-
-                if (mode === 1) {
-                    modeText = 'Single';
-                    pulseText = `P1: ${d1}ms`;
-                } else if (mode === 2) {
-                    modeText = 'Double';
-                    pulseText = `P1: ${d1}ms | Gap: ${gap1}ms | P2: ${d2}ms`;
-                } else if (mode === 3) {
-                    modeText = 'Triple';
-                    pulseText = `P1: ${d1}ms | Gap: ${gap1}ms | P2: ${d2}ms | Gap: ${gap2}ms | P3: ${d3}ms`;
-                }
-
-                let preheatText = preheatEn ? ` | 🔥Pre: ${preheatMs}ms@${preheatPct}% gap=${preheatGap}ms` : '';
-                let triggerText = liveTriggerMode === 'contact'
-                    ? ` | 🎯Probe Contact (${holdStepsToSecondsText(liveContactHoldSteps)})`
-                    : ' | 🎯Pedal';
-
-                const display = `${modeText} | ${pulseText} | ⚡${power}%${preheatText}${triggerText}`;
-
-                const activeSettingsEl = document.getElementById('active-settings');
-                if (activeSettingsEl) {
-                    activeSettingsEl.textContent = display;
-                    activeSettingsEl.style.color = '#4CAF50';
-                    setTimeout(() => {
-                        activeSettingsEl.style.color = '#fff';
-                    }, 300);
-                }
+        socket.on('command_ack', function (data) {
+            // Just clear pending for protected fields
+            if (data?.field && settingsSync.protectedFields.includes(data.field)) {
+                settingsSync.pendingChanges.delete(data.field);
             }
+
+            // Show success message
+            console.log('Command acknowledged:', data);
+            if (data?.ok === false) {
+                setSaveStatus(`⚠ ${data?.command || 'Command'} failed`, '#ff4d4f');
+            } else {
+                setSaveStatus('Command acknowledged', '#4CAF50');
+            }
+        });
+
+        socket.on('connect', () => {
+            console.log('SocketIO connected');
+        });
+
+        socket.on('disconnect', () => {
+            console.log('SocketIO disconnected');
+            setConnectionIndicator(false);
         });
 
         socket.on('pedal_active', (data) => {
@@ -1258,6 +1452,7 @@
             syncSlider('preheatDurationSlider', 'preheatDuration', 'preheatDurationValue', ' ms');
             syncSlider('preheatPowerSlider', 'preheatPower', 'preheatPowerValue', '%');
             syncSlider('preheatGapSlider', 'preheatGap', 'preheatGapValue', ' ms');
+            attachSliderDragListeners();
 
             const modeEl = document.getElementById('mode');
             if (modeEl) {
@@ -1265,29 +1460,29 @@
                 modeEl.dispatchEvent(new Event('change'));
             }
 
-            setTriggerMode(document.getElementById('triggerMode').value);
-            setContactHold(parseInt(document.getElementById('contactHoldSteps').value, 10));
+            setTriggerMode(document.getElementById('triggerMode').value, false);
+            setContactHold(parseInt(document.getElementById('contactHoldSteps').value, 10), false);
 
             const preheatEnable = document.getElementById('preheatEnable');
             const preheatControls = document.getElementById('preheatControls');
             if (preheatEnable && preheatControls) {
                 preheatEnable.addEventListener('change', () => {
                     preheatControls.style.display = preheatEnable.checked ? 'block' : 'none';
+                    settingsSync.sendCommand('preheat_en', preheatEnable.checked ? 1 : 0);
                     sendPreheatToESP32();
-                    updateActiveSettings();
                 });
             }
 
             ['preheatDuration', 'preheatPower', 'preheatGap'].forEach(id => {
                 const el = document.getElementById(id);
                 if (!el) return;
-                el.addEventListener('change', () => { sendPreheatToESP32(); updateActiveSettings(); });
+                el.addEventListener('change', () => { sendPreheatToESP32(); });
             });
 
             ['preheatDurationSlider', 'preheatPowerSlider', 'preheatGapSlider'].forEach(id => {
                 const el = document.getElementById(id);
                 if (!el) return;
-                el.addEventListener('input', () => { queuePreheatSend(); updateActiveSettings(); });
+                el.addEventListener('input', () => { queuePreheatSend(); });
             });
 
             [
@@ -1304,15 +1499,12 @@
                 el.addEventListener('input', () => {
                     currentPreset = null;
                     document.querySelectorAll('.preset-btn').forEach(btn => btn.classList.remove('active'));
-                    updateActiveSettings();
                 });
-
-                el.addEventListener('change', updateActiveSettings);
             });
 
+            setConnectionIndicator(false);
             loadSettings();
             loadPresets();
-            setTimeout(updateActiveSettings, 200);
         });
     </script>
 </body>
