@@ -735,12 +735,52 @@
         const PULSE_FIELD_STATUS_GUARD_MS = 2000;
         let pulseFieldGuardUntilMs = 0;
 
+        const LEAD_R_STATUS_GUARD_MS = 5000;
+        let leadRGuardUntilMs = 0;
+        let leadRUserEditedSinceLastSave = false;
+
         function startPulseFieldStatusGuard(durationMs = PULSE_FIELD_STATUS_GUARD_MS) {
             pulseFieldGuardUntilMs = Math.max(pulseFieldGuardUntilMs, Date.now() + durationMs);
         }
 
         function isPulseFieldStatusGuardActive() {
             return Date.now() < pulseFieldGuardUntilMs;
+        }
+
+        function startLeadRStatusGuard(durationMs = LEAD_R_STATUS_GUARD_MS) {
+            leadRGuardUntilMs = Math.max(leadRGuardUntilMs, Date.now() + durationMs);
+        }
+
+        function isLeadRStatusGuardActive() {
+            return Date.now() < leadRGuardUntilMs;
+        }
+
+        function markLeadRUserEdited() {
+            leadRUserEditedSinceLastSave = true;
+            startLeadRStatusGuard();
+        }
+
+        function clearLeadRUserEdited() {
+            leadRUserEditedSinceLastSave = false;
+        }
+
+        function extractLeadResistanceMohm(data) {
+            if (!data || typeof data !== 'object') return null;
+
+            if (typeof data.lead_r_mohm === 'number' && Number.isFinite(data.lead_r_mohm)) {
+                return data.lead_r_mohm;
+            }
+            if (typeof data.lead_r_ohm === 'number' && Number.isFinite(data.lead_r_ohm)) {
+                return data.lead_r_ohm * 1000.0;
+            }
+            if (typeof data.lead_resistance_mohm === 'number' && Number.isFinite(data.lead_resistance_mohm)) {
+                return data.lead_resistance_mohm;
+            }
+            if (typeof data.lead_resistance === 'number' && Number.isFinite(data.lead_resistance)) {
+                return data.lead_resistance * 1000.0;
+            }
+
+            return null;
         }
 
         class SettingsManager {
@@ -1055,6 +1095,14 @@
             if (Number.isFinite(holdSteps) && holdSteps >= 1) {
                 setContactHold(Math.round(holdSteps), false);
             }
+
+            const leadMohm = extractLeadResistanceMohm(data);
+            if (!leadRUserEditedSinceLastSave && !isLeadRStatusGuardActive() && leadMohm !== null && Number.isFinite(leadMohm)) {
+                const leadInput = document.getElementById('leadResistance');
+                if (leadInput && document.activeElement !== leadInput) {
+                    leadInput.value = leadMohm.toFixed(2);
+                }
+            }
         }
 
         function updateChargerCurrent(data) {
@@ -1118,6 +1166,7 @@
                 if (s.lead_resistance_mohm !== undefined) {
                     const leadEl = document.getElementById('leadResistance');
                     if (leadEl) leadEl.value = Number(s.lead_resistance_mohm).toFixed(2);
+                    clearLeadRUserEdited();
                 }
 
                 document.getElementById('mode').dispatchEvent(new Event('change'));
@@ -1153,6 +1202,7 @@
             // CRITICAL: lock before any async/network activity can begin.
             saveInProgress = true;
             startPulseFieldStatusGuard();
+            startLeadRStatusGuard();
             saveSettings(false, { preLocked: true });
         }
 
@@ -1162,6 +1212,7 @@
                 saveInProgress = true;
             }
             startPulseFieldStatusGuard();
+            startLeadRStatusGuard();
 
             const payload = collectSettingsPayload();
 
@@ -1182,6 +1233,7 @@
                 }
 
                 if ((body?.status === 'ok' && resp.ok) || resp.ok) {
+                    clearLeadRUserEdited();
                     if (!silent) {
                         setSaveStatus('Settings saved ✓', '#4CAF50');
                         setTimeout(() => setSaveStatus(''), 1200);
@@ -1410,19 +1462,10 @@
 
             applyStatusSettings(data);
 
-            let leadMohm = null;
-            if (typeof data.lead_r_mohm === 'number') {
-                leadMohm = data.lead_r_mohm;
-            } else if (typeof data.lead_r_ohm === 'number') {
-                leadMohm = data.lead_r_ohm * 1000.0;
-            }
+            const leadMohm = extractLeadResistanceMohm(data);
             if (leadMohm !== null && Number.isFinite(leadMohm)) {
                 const liveEl = document.getElementById('leadResistanceLive');
                 if (liveEl) liveEl.textContent = `Current STM32: ${leadMohm.toFixed(3)} mΩ`;
-                const leadInput = document.getElementById('leadResistance');
-                if (leadInput && document.activeElement !== leadInput) {
-                    leadInput.value = leadMohm.toFixed(2);
-                }
             }
 
             updateChargerCurrent(data);
@@ -1484,6 +1527,12 @@
             }
 
             // Numeric preheat controls are applied on Save via saveSettings().
+
+            const leadResistanceEl = document.getElementById('leadResistance');
+            if (leadResistanceEl) {
+                leadResistanceEl.addEventListener('input', markLeadRUserEdited);
+                leadResistanceEl.addEventListener('change', markLeadRUserEdited);
+            }
 
             [
                 'd1', 'gap1', 'd2', 'gap2', 'd3', 'mode',
