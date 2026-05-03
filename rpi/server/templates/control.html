@@ -1428,13 +1428,48 @@
                 });
         }
 
+        const VPACK_DISPLAY_DEADBAND_V = 0.01;
+        let lastDisplayedVpack = null;
+        let pendingVpackDisplayValue = null;
+        let vpackDisplayRafHandle = null;
+
+        function flushVpackDisplayUpdate() {
+            vpackDisplayRafHandle = null;
+            if (pendingVpackDisplayValue === null) return;
+
+            const vpackEl = document.getElementById('vpack');
+            if (!vpackEl) {
+                pendingVpackDisplayValue = null;
+                return;
+            }
+
+            const displayValue = pendingVpackDisplayValue;
+            pendingVpackDisplayValue = null;
+            vpackEl.textContent = `${displayValue.toFixed(2)} V`;
+            lastDisplayedVpack = displayValue;
+        }
+
+        function scheduleVpackDisplayUpdate(nextVpack) {
+            if (typeof nextVpack !== 'number' || !Number.isFinite(nextVpack)) return;
+
+            if (
+                typeof lastDisplayedVpack === 'number' &&
+                Number.isFinite(lastDisplayedVpack) &&
+                Math.abs(nextVpack - lastDisplayedVpack) <= VPACK_DISPLAY_DEADBAND_V
+            ) {
+                return;
+            }
+
+            pendingVpackDisplayValue = nextVpack;
+            if (vpackDisplayRafHandle !== null) return;
+            vpackDisplayRafHandle = window.requestAnimationFrame(flushVpackDisplayUpdate);
+        }
+
         socket.on('status_update', (data) => {
             console.log('📊 Status Update:', data);
             console.log('STATUS received, active drags:', Array.from(sliderDragState.activeDrags));
 
-            if (typeof data.vpack === 'number') {
-                document.getElementById('vpack').textContent = data.vpack.toFixed(2) + ' V';
-            }
+            scheduleVpackDisplayUpdate(data.vpack);
 
             const t = (typeof data.temp === 'number') ? data.temp
                 : (typeof data.temperature === 'number') ? data.temperature
