@@ -53,8 +53,11 @@ STATUS2_VPACK_DEADBAND_V = 0.08
 REQUEST_CELLS_ON_CONNECT = True
 
 # Settings save/ACK robustness tuning
-SETTINGS_ACK_TIMEOUT_S = 0.7
+# NOTE: STM32 may emit multiple DBG lines around flash writes before ACK/DENY,
+# so keep per-command timeout comfortably above sub-second defaults.
+SETTINGS_ACK_TIMEOUT_S = 2.5
 SETTINGS_ACK_RETRIES = 1
+SETTINGS_SAVE_TOTAL_TIMEOUT_S = 12.0
 
 LEAD_RESISTANCE_DEFAULT_MOHM = 1.87
 LEAD_RESISTANCE_MIN_MOHM = 0.10
@@ -78,9 +81,11 @@ _esp_manager_started = False
 last_weld_duration_ms = 0.0
 last_weld_meta = {}
 
-# ACK wait/notify bridge for reliable command application.
+# ACK/DENY wait-notify bridge for reliable command application.
 _ack_lock = threading.Lock()
 _ack_waiters: dict[str, deque] = defaultdict(deque)
+_deny_lock = threading.Lock()
+_deny_waiters: dict[str, deque] = defaultdict(deque)
 
 
 # ========== LOGGING ==========
@@ -181,12 +186,35 @@ def _coerce_scalar(raw: str):
         return raw
 
 
-def _parse_ack_line(line: str) -> dict | None:
-    """Parse ACK lines into structured payload for UI + waiter matching."""
-    if not line.startswith("ACK,"):
+def _extract_packet_tail(line: str, prefix: str) -> str | None:
+    """Return normalized packet tail (e.g. ACK,... / DENY,...) even if wrapped."""
+    if not line:
         return None
 
-    parts = [p.strip() for p in line.split(",") if p.strip()]
+    s = line.strip()
+    if s.startswith(prefix):
+        return s
+
+    search_from = 0
+    while True:
+        idx = s.find(prefix, search_from)
+        if idx < 0:
+            return None
+
+        # Guard against false positives like "NACK,...".
+        if idx == 0 or not (s[idx - 1].isalnum() or s[idx - 1] == "_"):
+            return s[idx:]
+
+        search_from = idx + 1
+
+
+def _parse_ack_line(line: str) -> dict | None:
+    """Parse ACK lines into structured payload for UI + waiter matching."""
+    packet = _extract_packet_tail(line, "ACK,")
+    if not packet:
+        return None
+
+    parts = [p.strip() for p in packet.split(",") if p.strip()]
     if len(parts) < 2:
         return None
 
@@ -216,12 +244,61 @@ def _parse_ack_line(line: str) -> dict | None:
     return payload
 
 
+def _parse_deny_line(line: str) -> dict | None:
+    """Parse DENY lines into structured payload for waiter handling."""
+    packet = _extract_packet_tail(line, "DENY,")
+    if not packet:
+        return None
+
+    parts = [p.strip() for p in packet.split(",") if p.strip()]
+    if len(parts) < 2:
+        return None
+
+    command = parts[1]
+    reason_tokens = parts[2:] if len(parts) > 2 else []
+    reason = ",".join(reason_tokens) if reason_tokens else command
+
+    return {
+        "raw": line,
+        "command": command,
+        "reason": reason,
+        "tokens": parts[1:],
+        "timestamp_ms": int(time.time() * 1000),
+    }
+
+
 def _register_ack_waiter(command: str):
     event = threading.Event()
-    waiter = {"event": event, "payload": None}
+    waiter = {"event": event, "payload": None, "command": command}
     with _ack_lock:
         _ack_waiters[command].append(waiter)
     return waiter
+
+
+def _remove_ack_waiter(command: str, waiter: dict) -> None:
+    with _ack_lock:
+        queue = _ack_waiters.get(command)
+        if queue and waiter in queue:
+            queue.remove(waiter)
+            if not queue:
+                _ack_waiters.pop(command, None)
+
+
+def _register_deny_waiter(expected_command: str):
+    event = threading.Event()
+    waiter = {"event": event, "payload": None, "expected_command": expected_command}
+    with _deny_lock:
+        _deny_waiters[expected_command].append(waiter)
+    return waiter
+
+
+def _remove_deny_waiter(expected_command: str, waiter: dict) -> None:
+    with _deny_lock:
+        queue = _deny_waiters.get(expected_command)
+        if queue and waiter in queue:
+            queue.remove(waiter)
+            if not queue:
+                _deny_waiters.pop(expected_command, None)
 
 
 def _notify_ack_waiters(payload: dict) -> None:
@@ -232,6 +309,7 @@ def _notify_ack_waiters(payload: dict) -> None:
     with _ack_lock:
         queue = _ack_waiters.get(command)
         if not queue:
+            log(f"🔎 ACK detected for '{command}' but no waiter is registered")
             return
         waiter = queue.popleft()
         if not queue:
@@ -239,11 +317,31 @@ def _notify_ack_waiters(payload: dict) -> None:
 
     waiter["payload"] = payload
     waiter["event"].set()
+    log(f"✅ ACK detected and matched waiter: command={command} payload={payload}")
+
+
+def _notify_deny_waiters(payload: dict) -> None:
+    command = str(payload.get("command", "")).strip()
+    if not command:
+        return
+
+    with _deny_lock:
+        queue = _deny_waiters.get(command)
+        if not queue:
+            log(f"🔎 DENY detected for '{command}' but no waiter is registered")
+            return
+        waiter = queue.popleft()
+        if not queue:
+            _deny_waiters.pop(command, None)
+
+    waiter["payload"] = payload
+    waiter["event"].set()
+    log(f"⛔ DENY detected and matched waiter: command={command} payload={payload}")
 
 
 def _send_command_with_ack(cmd: str, ack_command: str, timeout_s: float = SETTINGS_ACK_TIMEOUT_S,
                            retries: int = SETTINGS_ACK_RETRIES) -> dict:
-    """Send command and wait for matching ACK, with one retry for resilience."""
+    """Send command and wait for matching ACK. Fails fast on authoritative DENY."""
     global esp_link
 
     attempts = 0
@@ -254,40 +352,58 @@ def _send_command_with_ack(cmd: str, ack_command: str, timeout_s: float = SETTIN
             return {
                 "ok": False,
                 "ack": None,
+                "deny": None,
                 "attempts": attempts,
                 "error": "ESP32 not connected",
             }
 
-        waiter = _register_ack_waiter(ack_command)
+        ack_waiter = _register_ack_waiter(ack_command)
+        deny_waiter = _register_deny_waiter(ack_command)
+
         sent = esp_link.send_command(cmd)
         if not sent:
-            with _ack_lock:
-                queue = _ack_waiters.get(ack_command)
-                if queue and waiter in queue:
-                    queue.remove(waiter)
-                    if not queue:
-                        _ack_waiters.pop(ack_command, None)
+            _remove_ack_waiter(ack_command, ack_waiter)
+            _remove_deny_waiter(ack_command, deny_waiter)
             continue
 
-        if waiter["event"].wait(timeout_s):
-            return {
-                "ok": True,
-                "ack": waiter.get("payload"),
-                "attempts": attempts,
-                "error": None,
-            }
+        log(
+            f"⏳ Waiting for ACK/DENY: cmd='{cmd}' ack='{ack_command}' "
+            f"attempt={attempts} timeout_s={timeout_s:.2f}"
+        )
 
-        # Timeout: remove stale waiter then retry.
-        with _ack_lock:
-            queue = _ack_waiters.get(ack_command)
-            if queue and waiter in queue:
-                queue.remove(waiter)
-                if not queue:
-                    _ack_waiters.pop(ack_command, None)
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if ack_waiter["event"].wait(timeout=0.02):
+                _remove_deny_waiter(ack_command, deny_waiter)
+                log(f"✅ ACK wait satisfied: ack={ack_command} attempt={attempts}")
+                return {
+                    "ok": True,
+                    "ack": ack_waiter.get("payload"),
+                    "deny": None,
+                    "attempts": attempts,
+                    "error": None,
+                }
 
+            if deny_waiter["event"].is_set():
+                _remove_ack_waiter(ack_command, ack_waiter)
+                log(f"⛔ DENY wait satisfied: ack={ack_command} attempt={attempts}")
+                return {
+                    "ok": False,
+                    "ack": None,
+                    "deny": deny_waiter.get("payload"),
+                    "attempts": attempts,
+                    "error": f"DENY received for {ack_command}",
+                }
+
+        _remove_ack_waiter(ack_command, ack_waiter)
+        _remove_deny_waiter(ack_command, deny_waiter)
+        log(f"⌛ ACK wait timeout on attempt={attempts} ack={ack_command}")
+
+    log(f"❌ ACK timeout after retries: ack={ack_command} attempts={attempts}")
     return {
         "ok": False,
         "ack": None,
+        "deny": None,
         "attempts": attempts,
         "error": f"ACK timeout for {ack_command}",
     }
@@ -871,10 +987,16 @@ class ESP32Link:
             elif line.startswith("EVENT,"):
                 log("🧭 Routing packet -> _parse_event")
                 self._parse_event(line[6:])
-            elif line.startswith("DENY,"):
-                reason = line[5:]
-                log(f"🧭 Routing packet -> DENY handler ({reason})")
-                socketio.emit("deny_event", {"reason": reason})
+            elif "DENY," in line:
+                deny_payload = _parse_deny_line(line)
+                if deny_payload:
+                    reason = deny_payload.get("reason", "")
+                    log(f"🧭 Routing packet -> DENY handler ({reason})")
+                    _notify_deny_waiters(deny_payload)
+                    socketio.emit("deny_event", {"reason": reason, "payload": deny_payload})
+                else:
+                    log(f"⚠️ DENY-like line could not be parsed: {line}")
+                    socketio.emit("esp32_message", {"message": line})
             elif line.startswith("BOOT,"):
                 msg = line[5:]
                 log(f"🧭 Routing packet -> BOOT handler ({msg})")
@@ -883,11 +1005,15 @@ class ESP32Link:
                 payload = line.split(",", 1)[1] if "," in line else line.split(":", 1)[1]
                 log("🧭 Routing packet -> _parse_charger")
                 self._parse_charger(payload)
-            elif line.startswith("ACK,"):
+            elif "ACK," in line:
                 ack_payload = _parse_ack_line(line)
                 if ack_payload:
+                    log(f"🧭 Routing packet -> ACK handler ({ack_payload.get('command')})")
                     socketio.emit("command_ack", ack_payload)
                     _notify_ack_waiters(ack_payload)
+                else:
+                    log(f"⚠️ ACK-like line could not be parsed: {line}")
+                    socketio.emit("esp32_message", {"message": line})
             else:
                 log(f"⚠️ Unhandled packet type, forwarding raw to UI: {line}")
                 socketio.emit("esp32_message", {"message": line})
@@ -1843,32 +1969,83 @@ def api_save_settings():
         data.get("lead_resistance_mohm", LEAD_RESISTANCE_DEFAULT_MOHM)
     )
 
+    tx_id = str(uuid.uuid4())
+
+    if not (esp_link and esp_link.connected):
+        return jsonify({
+            "status": "error",
+            "tx_id": tx_id,
+            "message": "ESP32 not connected; cannot confirm hardware ACK",
+            "results": [],
+            "failed": [{"name": "connection", "error": "ESP32 not connected"}],
+        }), 503
+
+    plan = _build_settings_command_plan(data)
+    results = []
+    failed = []
+
+    deadline = time.time() + SETTINGS_SAVE_TOTAL_TIMEOUT_S
+
+    for item in plan:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            failed.append({
+                "name": item["name"],
+                "cmd": item["cmd"],
+                "ack": item["ack"],
+                "error": "save_settings overall timeout",
+            })
+            break
+
+        ack_timeout = min(remaining, SETTINGS_ACK_TIMEOUT_S)
+        ack_result = _send_command_with_ack(
+            item["cmd"],
+            item["ack"],
+            timeout_s=ack_timeout,
+            retries=SETTINGS_ACK_RETRIES,
+        )
+
+        result_entry = {
+            "name": item["name"],
+            "cmd": item["cmd"],
+            "ack": item["ack"],
+            "ok": bool(ack_result.get("ok")),
+            "attempts": ack_result.get("attempts", 0),
+            "ack_payload": ack_result.get("ack"),
+            "deny_payload": ack_result.get("deny"),
+            "error": ack_result.get("error"),
+        }
+        results.append(result_entry)
+
+        if not ack_result.get("ok"):
+            failed.append(result_entry)
+            break
+
+    if failed:
+        deny_present = any(entry.get("deny_payload") for entry in failed)
+        status_code = 400 if deny_present else 500
+        return jsonify({
+            "status": "error",
+            "tx_id": tx_id,
+            "message": "Hardware rejected settings" if deny_present else "Hardware ACK timeout/failure",
+            "results": results,
+            "failed": failed,
+        }), status_code
+
     if not save_settings(data):
-        return jsonify({"status": "error", "message": "Failed to save settings"}), 500
+        return jsonify({
+            "status": "error",
+            "tx_id": tx_id,
+            "message": "Hardware ACKed but local settings save failed",
+            "results": results,
+            "failed": [{"name": "local_save", "error": "Failed to save settings.json"}],
+        }), 500
 
     current_settings = data
 
-    tx_id = str(uuid.uuid4())
+    return jsonify({"status": "ok", "tx_id": tx_id, "results": results, "failed": []})
 
-    # Persist success should still return to UI even when hardware is offline.
-    if not (esp_link and esp_link.connected):
-        return jsonify({
-            "status": "ok",
-            "tx_id": tx_id,
-            "offline": True,
-            "message": "Settings saved locally; ESP32 not connected",
-            "results": [],
-            "failed": [],
-        })
 
-    plan = _build_settings_command_plan(data)
-
-    for item in plan:
-        esp_link.send_command(item["cmd"])
-        time.sleep(0.03)  # 30ms pacing only
-    # Done. ESP32 will push STATUS back confirming the change.
-
-    return jsonify({"status": "ok", "tx_id": tx_id, "results": [], "failed": []})
 @app.route("/api/set_power", methods=["POST"])
 def api_set_power():
     global current_settings

@@ -11,7 +11,7 @@
   "preheat_duration": 20,
   "preheat_power": 50,
   "preheat_gap_ms": 5,
-  "trigger_mode": "contact",
+  "trigger_mode": "pedal",
   "contact_hold_steps": 2,
   "lead_resistance_mohm": 2.0
 }
