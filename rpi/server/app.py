@@ -49,14 +49,6 @@ STATUS2_CHARGE_NOISE_THRESHOLD_A = 0.2
 # UI voltage is only allowed to move if absolute change exceeds this threshold.
 STATUS2_VPACK_DEADBAND_V = 0.08
 
-# Deadband for STATUS vpack emission smoothing.
-# Only update UI if voltage changes by more than 50mV.
-VPACK_DEADBAND_V = 0.05
-
-# Deadband for STATUS vcap emission smoothing.
-# Only update UI if voltage changes by more than 50mV.
-VCAP_DEADBAND_V = 0.05
-
 # If your ESP supports a "CELLS" command, keep True. Otherwise set False.
 REQUEST_CELLS_ON_CONNECT = True
 
@@ -85,12 +77,6 @@ current_settings = {}
 _esp_manager_started = False
 last_weld_duration_ms = 0.0
 last_weld_meta = {}
-
-# STATUS vpack/vcap deadband anchor state.
-last_emitted_vpack = 0.0
-has_emitted_vpack = False
-last_emitted_vcap = 0.0
-has_emitted_vcap = False
 
 # ACK wait/notify bridge for reliable command application.
 _ack_lock = threading.Lock()
@@ -170,43 +156,12 @@ def emit_status_update(patch: dict | None = None) -> None:
     Emit a single merged status_update payload to the UI.
 
     - Merges `patch` into `last_status`
-    - Applies STATUS vpack/vcap deadband smoothing when those keys are present in patch
     - Always includes `esp_connected`
     """
-    global last_status, esp_connected, last_emitted_vpack, has_emitted_vpack, last_emitted_vcap, has_emitted_vcap
+    global last_status, esp_connected
     try:
         if patch:
-            filtered_patch = dict(patch)
-
-            # STATUS-side vpack deadband to suppress 1-2mV jitter flicker in UI.
-            if "vpack" in filtered_patch:
-                try:
-                    new_vpack = float(filtered_patch["vpack"])
-                    if (not has_emitted_vpack) or abs(new_vpack - last_emitted_vpack) > VPACK_DEADBAND_V:
-                        last_emitted_vpack = new_vpack
-                        has_emitted_vpack = True
-                    else:
-                        # Keep previously emitted value while still allowing
-                        # other status fields to propagate.
-                        filtered_patch["vpack"] = last_emitted_vpack
-                except Exception:
-                    pass
-
-            # STATUS-side vcap deadband to suppress tiny telemetry jitter.
-            if "vcap" in filtered_patch:
-                try:
-                    new_vcap = float(filtered_patch["vcap"])
-                    if (not has_emitted_vcap) or abs(new_vcap - last_emitted_vcap) > VCAP_DEADBAND_V:
-                        last_emitted_vcap = new_vcap
-                        has_emitted_vcap = True
-                    else:
-                        # Keep previously emitted value while still allowing
-                        # other status fields to propagate.
-                        filtered_patch["vcap"] = last_emitted_vcap
-                except Exception:
-                    pass
-
-            last_status.update(filtered_patch)
+            last_status.update(patch)
 
         payload = {**last_status, "esp_connected": esp_connected}
         socketio.emit("status_update", payload)
