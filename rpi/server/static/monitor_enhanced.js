@@ -5,8 +5,6 @@
 const socket = io();
 let waveformChart = null;
 
-const DEFAULT_SAMPLE_INTERVAL_MS = 0.1;
-
 // ── Connection status ────────────────────────────────────────
 socket.on('connect', function () {
     console.log('SocketIO connected');
@@ -19,6 +17,19 @@ socket.on('disconnect', function () {
     const el = document.getElementById('connectionStatus');
     if (el) { el.textContent = 'Disconnected'; el.className = 'connection-status disconnected'; }
 });
+
+function isFiniteNum(v) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+}
+
+function toConfiguredMs(v) {
+    if (v === null || v === undefined || v === '') return null;
+    const n = isFiniteNum(v);
+    if (n === null || n < 0) return null;
+    return Math.round(n);
+}
+
 
 // ── Chart initialisation ─────────────────────────────────────
 document.addEventListener('DOMContentLoaded', function () {
@@ -101,7 +112,7 @@ function setText(id, val, decimals) {
 socket.on('weld_complete', function (data) {
     console.log('weld_complete:', data);
 
-    const energyJ = data.energy_joules !== undefined ? data.energy_joules : data.energy_j;
+    const energyJ = data.energy_weld_j !== undefined ? data.energy_weld_j : (data.energy_joules !== undefined ? data.energy_joules : data.energy_j);
     const vDrop = data.voltage_drop !== undefined
         ? data.voltage_drop
         : (data.vcap_before - data.vcap_after);
@@ -109,7 +120,14 @@ socket.on('weld_complete', function (data) {
     setText('peakCurrent', data.peak_current_amps, 1);
     setText('avgCurrent', data.avg_current_amps, 1);
     setText('energy', energyJ, 2);
-    setText('duration', data.duration_ms, 1);
+
+    const configuredMainDurationMs = toConfiguredMs(data.configured_main_ms ?? data.d1);
+    if (configuredMainDurationMs !== null) {
+        setText('duration', configuredMainDurationMs, 0);
+    } else {
+        setText('duration', null, 0);
+    }
+
     setText('voltageDrop', vDrop, 3);
 
     setText('vcapBefore', data.vcap_before, 3);
@@ -143,69 +161,26 @@ socket.on('weld_event', function (data) {
 // ── Waveform data ─────────────────────────────────────────────
 socket.on('waveform_data', function (data) {
     const samples = Array.isArray(data && data.samples) ? data.samples : [];
-    console.log('waveform_data: ' + samples.length + ' samples');
+    if (!waveformChart || samples.length === 0) return;
 
-    if (!waveformChart) { console.error('Chart not ready'); return; }
-    if (samples.length === 0) { console.warn('Empty waveform payload'); return; }
+    const chartData = samples
+        .map(function (s) {
+            const t = Number(s.timestamp_us);
+            const i = Number(s.current);
+            if (!Number.isFinite(t) || !Number.isFinite(i)) return null;
+            return { x: t / 1000.0, y: i };
+        })
+        .filter(Boolean);
 
-    const currentPts = [];
+    if (chartData.length === 0) return;
 
-    const meta = (data && typeof data.meta === 'object' && data.meta) ? data.meta : {};
-    const sampleIntervalMs = Number.isFinite(Number(meta.sample_interval_ms))
-        ? Number(meta.sample_interval_ms)
-        : DEFAULT_SAMPLE_INTERVAL_MS;
-
-    samples.forEach(function (s, i) {
-        let t = NaN;
-
-        if (Number.isFinite(Number(s.t))) {
-            t = Number(s.t);
-        } else if (Number.isFinite(Number(s.time_ms))) {
-            t = Number(s.time_ms);
-        } else if (Number.isFinite(Number(s.timestamp_us))) {
-            t = Number(s.timestamp_us) / 1000.0;
-        } else {
-            t = i * sampleIntervalMs;
-        }
-
-        const c = Number(s.current);
-        if (Number.isFinite(c) && Number.isFinite(t)) currentPts.push({ x: t, y: c });
-    });
-
-    if (currentPts.length === 0) { console.warn('No valid current points'); return; }
-
-    const pointMinT = Math.min(...currentPts.map(p => p.x));
-    const pointMaxT = Math.max(...currentPts.map(p => p.x));
-
-    const metaMinT = Number(meta.axis_min_time_ms);
-    const metaMaxT = Number(meta.axis_max_time_ms);
-
-    const minT = Number.isFinite(metaMinT) ? Math.min(pointMinT, metaMinT) : pointMinT;
-    let maxT = Number.isFinite(metaMaxT) ? Math.max(pointMaxT, metaMaxT) : pointMaxT;
-
-    // Backward-compatible fallback for legacy packets that only provide wf_samples.
-    const wfSamples = Number(meta.wf_samples);
-    const pulseStartSample = Number(meta.pulse_start_sample);
-    if (Number.isFinite(wfSamples) && Number.isFinite(pulseStartSample) && wfSamples > pulseStartSample) {
-        const computedMax = ((wfSamples - pulseStartSample) - 1) * sampleIntervalMs;
-        if (Number.isFinite(computedMax)) {
-            maxT = Math.max(maxT, computedMax);
-        }
-    }
-    waveformChart.options.scales.x.min = minT;
-    waveformChart.options.scales.x.max = maxT;
-
-    // Auto-scale Y directly from waveform peak (no fixed 2000A floor).
-    const peakA = Math.max(...currentPts.map(p => p.y));
-    const yHeadroom = Math.max(5, peakA * 0.12);
-    const yMax = Math.ceil((peakA + yHeadroom) / 10) * 10;
+    const peakA = Math.max(...chartData.map(p => p.y));
+    const yMax = Math.ceil((peakA * 1.12) / 10) * 10;
     waveformChart.options.scales.y.max = Math.max(20, yMax);
-
+    waveformChart.options.scales.x.min = 0;
+    waveformChart.options.scales.x.max = undefined;
     waveformChart.data.labels = [];
-    waveformChart.data.datasets[0].data = currentPts;
-    waveformChart.update('active');
+    waveformChart.data.datasets[0].data = chartData;
 
-    const currents = currentPts.map(p => p.y);
-    console.log('Chart updated | time ' + minT.toFixed(2) + '–' + maxT.toFixed(2) +
-        ' ms | current ' + Math.min(...currents).toFixed(0) + '–' + Math.max(...currents).toFixed(0) + ' A');
+    waveformChart.update('none');
 });

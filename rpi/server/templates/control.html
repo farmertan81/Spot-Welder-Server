@@ -708,9 +708,8 @@
                     </div>
 
                     <div style="display:flex; align-items:center; gap:10px; margin-top:8px;">
-                        <button class="btn btn-primary"
-                            style="width: 72px; padding: 6px 10px; font-size: 0.85em;"
-                            onclick="saveSettings()">Save</button>
+                        <button class="btn btn-primary" style="width: 72px; padding: 6px 10px; font-size: 0.85em;"
+                            onclick="onSaveSettingsClick()">Save</button>
                         <span id="saveStatusText" class="inline-note" style="min-height: 18px;"></span>
                     </div>
                 </div>
@@ -731,6 +730,18 @@
 
         let presets = {};
         let currentPreset = null;
+        let saveInProgress = false; // Blocks full STATUS field apply while save transaction is active
+
+        const PULSE_FIELD_STATUS_GUARD_MS = 2000;
+        let pulseFieldGuardUntilMs = 0;
+
+        function startPulseFieldStatusGuard(durationMs = PULSE_FIELD_STATUS_GUARD_MS) {
+            pulseFieldGuardUntilMs = Math.max(pulseFieldGuardUntilMs, Date.now() + durationMs);
+        }
+
+        function isPulseFieldStatusGuardActive() {
+            return Date.now() < pulseFieldGuardUntilMs;
+        }
 
         class SettingsManager {
             constructor() {
@@ -892,28 +903,8 @@
             };
         }
 
-        async function sendPreheatToESP32() {
-            const enabled = document.getElementById('preheatEnable').checked;
-            const duration = parseInt(document.getElementById('preheatDuration').value, 10);
-            const power = parseInt(document.getElementById('preheatPower').value, 10);
-            const gap_ms = parseInt(document.getElementById('preheatGap').value, 10);
-
-            // Left here intentionally in case you already wire this elsewhere.
-            // If you later want this to actively push preheat changes live, hook it to your API/serial layer.
-            void enabled;
-            void duration;
-            void power;
-            void gap_ms;
-        }
-
-        let preheatTimer = null;
-        function queuePreheatSend() {
-            if (preheatTimer) clearTimeout(preheatTimer);
-            preheatTimer = setTimeout(() => {
-                sendPreheatToESP32();
-                preheatTimer = null;
-            }, 150);
-        }
+        // Preheat values are persisted through saveSettings(); no separate live
+        // preheat sender is used here to avoid dead/stub call paths.
 
         function onModeChanged(e) {
             const mode = parseInt(e.target.value, 10);
@@ -995,9 +986,12 @@
 
         function applyStatusSettings(data) {
             if (!data || typeof data !== 'object') return;
+            if (saveInProgress) return; // Block broad field sync while an explicit save request is in flight.
+
+            const pulseGuardActive = isPulseFieldStatusGuardActive();
 
             const mode = Number(data.mode);
-            if (Number.isFinite(mode) && mode >= 1 && mode <= 3) {
+            if (!pulseGuardActive && Number.isFinite(mode) && mode >= 1 && mode <= 3) {
                 const modeEl = document.getElementById('mode');
                 if (modeEl && document.activeElement !== modeEl) {
                     modeEl.value = String(mode);
@@ -1005,14 +999,16 @@
                 }
             }
 
-            const pulseKeys = ['d1', 'gap1', 'd2', 'gap2', 'd3'];
-            pulseKeys.forEach((key) => {
-                const v = Number(data[key]);
-                const el = document.getElementById(key);
-                if (Number.isFinite(v) && el && document.activeElement !== el) {
-                    el.value = String(Math.round(v));
-                }
-            });
+            if (!pulseGuardActive) {
+                const pulseKeys = ['d1', 'gap1', 'd2', 'gap2', 'd3'];
+                pulseKeys.forEach((key) => {
+                    const v = Number(data[key]);
+                    const el = document.getElementById(key);
+                    if (Number.isFinite(v) && el && document.activeElement !== el) {
+                        el.value = String(Math.round(v));
+                    }
+                });
+            }
 
             const power = Number(data.power_pct ?? data.power);
             if (Number.isFinite(power)) {
@@ -1153,7 +1149,20 @@
             };
         }
 
-        async function saveSettings(silent = false) {
+        function onSaveSettingsClick() {
+            // CRITICAL: lock before any async/network activity can begin.
+            saveInProgress = true;
+            startPulseFieldStatusGuard();
+            saveSettings(false, { preLocked: true });
+        }
+
+        async function saveSettings(silent = false, options = {}) {
+            const preLocked = !!options.preLocked;
+            if (!preLocked) {
+                saveInProgress = true;
+            }
+            startPulseFieldStatusGuard();
+
             const payload = collectSettingsPayload();
 
             if (!silent) setSaveStatus('Saving…', '#ffae42');
@@ -1189,6 +1198,8 @@
             } catch (err) {
                 console.error('saveSettings error:', err);
                 if (!silent) setSaveStatus('Save failed', '#ff4d4f');
+            } finally {
+                saveInProgress = false;
             }
         }
 
@@ -1381,8 +1392,8 @@
                 document.getElementById('temp').textContent = t.toFixed(1) + ' °C';
             }
 
-            if (typeof data.weld_counter === 'number') {
-                document.getElementById('counter').textContent = data.weld_counter;
+            if (typeof data.weld_count === 'number') {
+                document.getElementById('counter').textContent = data.weld_count;
             }
 
             if (typeof data.C1 === 'number') document.getElementById('c1').textContent = data.C1.toFixed(2) + 'V';
@@ -1469,21 +1480,10 @@
                 preheatEnable.addEventListener('change', () => {
                     preheatControls.style.display = preheatEnable.checked ? 'block' : 'none';
                     settingsSync.sendCommand('preheat_en', preheatEnable.checked ? 1 : 0);
-                    sendPreheatToESP32();
                 });
             }
 
-            ['preheatDuration', 'preheatPower', 'preheatGap'].forEach(id => {
-                const el = document.getElementById(id);
-                if (!el) return;
-                el.addEventListener('change', () => { sendPreheatToESP32(); });
-            });
-
-            ['preheatDurationSlider', 'preheatPowerSlider', 'preheatGapSlider'].forEach(id => {
-                const el = document.getElementById(id);
-                if (!el) return;
-                el.addEventListener('input', () => { queuePreheatSend(); });
-            });
+            // Numeric preheat controls are applied on Save via saveSettings().
 
             [
                 'd1', 'gap1', 'd2', 'gap2', 'd3', 'mode',

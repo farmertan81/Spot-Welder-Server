@@ -436,72 +436,61 @@ def save_settings(settings: dict) -> bool:
 
 def settings_with_live_status(base_settings: dict) -> dict:
     """
-    Merge runtime STATUS-derived settings into persisted settings.
+    Compose API settings payload with clear source-of-truth boundaries:
 
-    STM32 runtime values are the source of truth when available, while file
-    settings remain fallback defaults before first STATUS arrives.
+    - Static recipe/config fields come from persisted settings.json
+      (mode/pulse timings/power/preheat/trigger/etc).
+    - Dynamic runtime telemetry comes from live STATUS/STATUS2 when available
+      (enabled, vpack, temp, weld_count, C1/C2/C3).
     """
     merged = dict(base_settings or {})
+    live = dict(last_status or {})
 
-    def _iget(key: str):
+    def _live_first(*keys):
+        for key in keys:
+            if key in live:
+                value = live.get(key)
+                if value is not None:
+                    return value
+        return None
+
+    def _to_int(value):
         try:
-            return int(last_status[key])
+            return int(value)
         except Exception:
             return None
 
-    def _fget(key: str):
+    def _to_float(value):
         try:
-            return float(last_status[key])
+            return float(value)
         except Exception:
             return None
 
-    mode = _iget("mode")
-    if mode is not None:
-        merged["mode"] = mode
+    enabled = _to_int(_live_first("enabled", "armed"))
+    if enabled is not None:
+        merged["enabled"] = 1 if enabled == 1 else 0
 
-    for dst, src in (("d1", "d1"), ("gap1", "gap1"), ("d2", "d2"),
-                     ("gap2", "gap2"), ("d3", "d3")):
-        val = _iget(src)
-        if val is not None:
-            merged[dst] = val
+    vpack = _to_float(_live_first("vpack", "vcap"))
+    if vpack is not None:
+        merged["vpack"] = vpack
 
-    power = _iget("power_pct")
-    if power is None:
-        power = _iget("power")
-    if power is not None:
-        merged["power"] = power
+    temp = _live_first("temp")
+    if temp is not None:
+        temp_f = _to_float(temp)
+        merged["temp"] = temp_f if temp_f is not None else temp
 
-    pre_en = _iget("preheat_en")
-    if pre_en is not None:
-        merged["preheat_enabled"] = (pre_en == 1)
+    weld_count = _to_int(_live_first("weld_count", "weld_counter"))
+    if weld_count is not None:
+        merged["weld_count"] = weld_count
 
-    pre_ms = _iget("preheat_ms")
-    if pre_ms is not None:
-        merged["preheat_duration"] = pre_ms
-
-    pre_pct = _iget("preheat_pct")
-    if pre_pct is not None:
-        merged["preheat_power"] = pre_pct
-
-    pre_gap = _iget("preheat_gap_ms")
-    if pre_gap is not None:
-        merged["preheat_gap_ms"] = pre_gap
-
-    trig = _iget("trigger_mode")
-    if trig is not None:
-        merged["trigger_mode"] = "contact" if trig == 2 else "pedal"
-
-    hold_steps = _iget("contact_hold_steps")
-    if hold_steps is not None:
-        merged["contact_hold_steps"] = hold_steps
-
-    lead_mohm = _fget("lead_r_mohm")
-    if lead_mohm is None:
-        lead_ohm = _fget("lead_r_ohm")
-        if lead_ohm is not None:
-            lead_mohm = lead_ohm * 1000.0
-    if lead_mohm is not None:
-        merged["lead_resistance_mohm"] = _normalize_lead_resistance_mohm(lead_mohm)
+    for out_key, aliases in (
+        ("C1", ("C1", "cell1", "cell_1", "c1")),
+        ("C2", ("C2", "cell2", "cell_2", "c2")),
+        ("C3", ("C3", "cell3", "cell_3", "c3")),
+    ):
+        cell_v = _to_float(_live_first(*aliases))
+        if cell_v is not None:
+            merged[out_key] = cell_v
 
     return merged
 
@@ -810,6 +799,17 @@ class ESP32Link:
                 self._parse_status2(line[8:])
             elif line.startswith("WAVEFORM_START,"):
                 log("🧭 Routing packet -> _parse_waveform_start")
+                parts = line.split(",")
+                if len(parts) >= 8:
+                    socketio.emit("waveform_start", {
+                        "total": int(parts[1]),
+                        "pre_start": int(parts[2]),
+                        "pre_end": int(parts[3]),
+                        "gap_start": int(parts[4]),
+                        "gap_end": int(parts[5]),
+                        "main_start": int(parts[6]),
+                        "main_end": int(parts[7]),
+                    })
                 self._parse_waveform_start(line)
             elif line.startswith("WAVEFORM_DATA,"):
                 log("🧭 Routing packet -> _parse_waveform_data")
@@ -817,6 +817,47 @@ class ESP32Link:
             elif line == "WAVEFORM_END":
                 log("🧭 Routing packet -> _finalize_chunked_waveform")
                 self._finalize_chunked_waveform()
+            elif line.startswith("WAVEFORM_PHASES,"):
+                # NEW protocol (6 fields):
+                # WAVEFORM_PHASES,preheat_start=X,preheat_end=Y,gap_start=Y,gap_end=Z,main_start=A,main_end=B
+                # Legacy protocol (4 fields):
+                # WAVEFORM_PHASES,preheat_start=X,preheat_end=Y,main_start=A,main_end=B
+                try:
+                    parts = line.replace("WAVEFORM_PHASES,", "").split(",")
+                    parsed_fields = {}
+                    for part in parts:
+                        if "=" in part:
+                            key, val = part.split("=", 1)
+                            parsed_fields[key.strip()] = int(val.strip())
+
+                    # Always emit a stable payload shape for frontend compatibility.
+                    preheat_start = parsed_fields.get("preheat_start")
+                    preheat_end = parsed_fields.get("preheat_end")
+                    gap_start = parsed_fields.get("gap_start")
+                    gap_end = parsed_fields.get("gap_end")
+                    main_start = parsed_fields.get("main_start")
+                    main_end = parsed_fields.get("main_end")
+
+                    # Backward compatibility: old firmware has no explicit gap_start/gap_end.
+                    # Use the inferred interval between preheat_end and main_start.
+                    if gap_start is None and preheat_end is not None:
+                        gap_start = preheat_end
+                    if gap_end is None and main_start is not None:
+                        gap_end = main_start
+
+                    phase_data = {
+                        "preheat_start": preheat_start,
+                        "preheat_end": preheat_end,
+                        "gap_start": gap_start,
+                        "gap_end": gap_end,
+                        "main_start": main_start,
+                        "main_end": main_end,
+                    }
+
+                    socketio.emit("waveform_phases", phase_data)
+                    log(f"📤 Emitting waveform_phases: {phase_data}")
+                except Exception as phase_err:
+                    log(f"⚠️ Failed to parse WAVEFORM_PHASES: {phase_err} | line={line}")
             elif line.startswith("WAVEFORM,"):
                 # Backward compatibility: legacy single-line waveform payload.
                 # If chunked mode is active, keep chunked parser as source of truth.
@@ -917,90 +958,99 @@ class ESP32Link:
             log(f"⚠️ Failed to parse CHARGER: {e}")
 
     def _parse_status2(self, data: str) -> None:
-        """Parse STATUS2,<k=v,...> for INA226 telemetry and cell details."""
-        global last_status
-        try:
-            parsed = {}
-            for pair in data.split(","):
-                if "=" in pair:
-                    key, val = pair.split("=", 1)
-                    key = key.strip()
-                    val = val.strip()
-                    try:
-                        parsed[key] = float(val)
-                    except Exception:
-                        parsed[key] = val
+            """Parse STATUS2,<k=v,...> for INA226 telemetry and cell details."""
+            global last_status
+            try:
+                parsed = {}
+                for pair in data.split(","):
+                    if "=" in pair:
+                        key, val = pair.split("=", 1)
+                        key = key.strip()
+                        val = val.strip()
+                        try:
+                            parsed[key] = float(val)
+                        except Exception:
+                            parsed[key] = val
 
-            # Suppress tiny phantom charger-current noise from INA226 telemetry.
-            # Keep this narrow so real charging current still shows up promptly.
-            for charge_key in ("charge_a", "ichg"):
-                if charge_key in parsed:
-                    try:
-                        charge_current = float(parsed[charge_key])
-                        if abs(charge_current) < STATUS2_CHARGE_NOISE_THRESHOLD_A:
-                            parsed[charge_key] = 0.0
-                    except Exception:
-                        # Non-numeric value; leave untouched.
-                        pass
+                # 1. Suppress tiny phantom charger-current noise from INA226 telemetry.
+                for charge_key in ("charge_a", "ichg"):
+                    if charge_key in parsed:
+                        try:
+                            charge_current = float(parsed[charge_key])
+                            if abs(charge_current) < STATUS2_CHARGE_NOISE_THRESHOLD_A:
+                                parsed[charge_key] = 0.0
+                        except Exception:
+                            pass
 
-            # Deadband filter for pack-voltage display smoothing.
-            # Keep STATUS2 update cadence unchanged; only clamp tiny vpack moves.
-            if "vpack" in parsed:
-                try:
-                    new_vpack = float(parsed["vpack"])
+                # 2. Deadband filter for pack-voltage AND cell-voltage display smoothing.
+                # We map keys to their specific deadband thresholds.
+                smoothing_map = {
+                    "vpack": 0.06,  # 60mV jitter filter
+                    "cell1": 0.015, # 15mV jitter filter (kills 2.97<->2.98 bounce)
+                    "cell2": 0.015,
+                    "cell3": 0.015,
+                    "vlow":  0.015,
+                    "vmid":  0.015
+                }
 
-                    if self.last_vpack_emitted is None:
-                        # First sample always passes through.
-                        self.last_vpack_emitted = new_vpack
-                    elif abs(new_vpack - self.last_vpack_emitted) <= STATUS2_VPACK_DEADBAND_V:
-                        # Within deadband: hold last emitted value to suppress twitching.
-                        parsed["vpack"] = self.last_vpack_emitted
-                    else:
-                        # Meaningful voltage movement: allow update.
-                        self.last_vpack_emitted = new_vpack
-                except Exception:
-                    # Non-numeric value; leave untouched.
-                    pass
+                # Initialize tracking dict if not exists
+                if not hasattr(self, 'last_emitted_values'):
+                    self.last_emitted_values = {}
 
-            # Dialect alignment aliases for older/newer frontend keys.
-            # STM32 emits: cell1/cell2/cell3 (and optionally cell4 in some builds).
-            # Keep both naming styles to avoid breaking any UI variant.
-            cell_aliases = {
-                "cell1": ("cell_1", "C1"),
-                "cell2": ("cell_2", "C2"),
-                "cell3": ("cell_3", "C3"),
-                "cell4": ("cell_4", "C4"),
-            }
-            for src_key, alias_keys in cell_aliases.items():
-                if src_key in parsed:
-                    for alias_key in alias_keys:
-                        parsed[alias_key] = parsed[src_key]
+                for key, threshold in smoothing_map.items():
+                    if key in parsed:
+                        try:
+                            new_val = float(parsed[key])
+                            last_val = self.last_emitted_values.get(key)
 
-            if any(k in parsed for k in ("cell1", "cell2", "cell3", "cell4")):
-                log(
-                    "🧩 STATUS2 cell mapping: "
-                    f"cell1={parsed.get('cell1')}→{parsed.get('cell_1')}, "
-                    f"cell2={parsed.get('cell2')}→{parsed.get('cell_2')}, "
-                    f"cell3={parsed.get('cell3')}→{parsed.get('cell_3')}, "
-                    f"cell4={parsed.get('cell4')}→{parsed.get('cell_4')}"
-                )
+                            if last_val is None:
+                                self.last_emitted_values[key] = new_val
+                            elif abs(new_val - last_val) <= threshold:
+                                # WITHIN DEADBAND: Use the last value to stop the flicker
+                                parsed[key] = last_val
+                                # CRITICAL: We don't update last_emitted_values here
+                                # so that the 'anchor' stays solid until a real move occurs.
+                            else:
+                                # SIGNIFICANT MOVE: Update the anchor and allow the value
+                                self.last_emitted_values[key] = new_val
+                        except Exception:
+                            pass
 
-            # If vpack is not available for any reason, fall back to vcap if present.
-            if "vpack" not in parsed and "vcap" in last_status:
-                parsed["vpack"] = last_status["vcap"]
+                # 3. Dialect alignment aliases
+                cell_aliases = {
+                    "cell1": ("cell_1", "C1"),
+                    "cell2": ("cell_2", "C2"),
+                    "cell3": ("cell_3", "C3"),
+                    "cell4": ("cell_4", "C4"),
+                }
+                for src_key, alias_keys in cell_aliases.items():
+                    if src_key in parsed:
+                        for alias_key in alias_keys:
+                            parsed[alias_key] = parsed[src_key]
 
-            log(f"🧩 Parsed STATUS2: {parsed}")
-            last_status.update(parsed)
-            emit_status_update({})
-            log("📤 Emitting event: status_update (from STATUS2)")
+                # 4. Fallback logic
+                if "vpack" not in parsed and "vcap" in last_status:
+                    parsed["vpack"] = last_status["vcap"]
 
-        except Exception as e:
-            log(f"⚠️ Failed to parse STATUS2: {e}")
+                last_status.update(parsed)
+                emit_status_update({})
+
+            except Exception as e:
+                log(f"⚠️ Failed to parse STATUS2: {e}")
 
     def _reset_chunked_waveform_state(self) -> None:
         self.chunked_waveform_expected_count = 0
         self.chunked_waveform_pulse_start = DEFAULT_PULSE_START_SAMPLE
         self.chunked_waveform_pulse_end = DEFAULT_PULSE_START_SAMPLE
+
+        # Optional multi-phase markers (sample indices in full capture window).
+        self.chunked_waveform_preheat_start = None
+        self.chunked_waveform_preheat_end = None
+        self.chunked_waveform_gap_start = None
+        self.chunked_waveform_gap_end = None
+        self.chunked_waveform_main_start = None
+        self.chunked_waveform_main_end = None
+
         # sample tuple = (timestamp_us_or_none, current_amps, voltage_volts)
         self.chunked_waveform_samples: dict[int, tuple[float | None, float, float]] = {}
         self.chunked_waveform_expected_indices: set[int] = set()
@@ -1061,8 +1111,28 @@ class ESP32Link:
                 return
 
             expected_count = int(parts[1])
-            pulse_start = int(parts[2])
-            pulse_end = int(parts[3])
+
+            # Backward compatibility:
+            # - Legacy format: WAVEFORM_START,total,main_start,main_end
+            # - New format:    WAVEFORM_START,total,pre_s,pre_e,gap_s,gap_e,main_s,main_e
+            if len(parts) >= 8:
+                preheat_start = int(parts[2])
+                preheat_end = int(parts[3])
+                gap_start = int(parts[4])
+                gap_end = int(parts[5])
+                main_start = int(parts[6])
+                main_end = int(parts[7])
+                pulse_start = main_start
+                pulse_end = main_end
+            else:
+                preheat_start = None
+                preheat_end = None
+                gap_start = None
+                gap_end = None
+                main_start = int(parts[2])
+                main_end = int(parts[3])
+                pulse_start = main_start
+                pulse_end = main_end
 
             if expected_count <= 0:
                 log(f"⚠️ WAVEFORM_START invalid sample count: {expected_count}")
@@ -1079,17 +1149,33 @@ class ESP32Link:
                     f"received={prev_received}, missing={prev_missing})"
                 )
 
+            def _clamp_marker(v):
+                if v is None:
+                    return None
+                return max(0, min(int(v), expected_count))
+
             self._reset_chunked_waveform_state()
             self.chunked_waveform_expected_count = expected_count
             self.chunked_waveform_pulse_start = max(0, min(pulse_start, expected_count - 1))
             self.chunked_waveform_pulse_end = max(self.chunked_waveform_pulse_start, min(pulse_end, expected_count))
+
+            self.chunked_waveform_preheat_start = _clamp_marker(preheat_start)
+            self.chunked_waveform_preheat_end = _clamp_marker(preheat_end)
+            self.chunked_waveform_gap_start = _clamp_marker(gap_start)
+            self.chunked_waveform_gap_end = _clamp_marker(gap_end)
+            self.chunked_waveform_main_start = _clamp_marker(main_start)
+            self.chunked_waveform_main_end = _clamp_marker(main_end)
+
             self.chunked_waveform_expected_indices = set(range(expected_count))
             self.chunked_waveform_active = True
 
             log(
                 "📥 WAVEFORM_START received: "
                 f"{expected_count} samples (pulse_start={self.chunked_waveform_pulse_start}, "
-                f"pulse_end={self.chunked_waveform_pulse_end})"
+                f"pulse_end={self.chunked_waveform_pulse_end}, "
+                f"preheat={self.chunked_waveform_preheat_start}-{self.chunked_waveform_preheat_end}, "
+                f"gap={self.chunked_waveform_gap_start}-{self.chunked_waveform_gap_end}, "
+                f"main={self.chunked_waveform_main_start}-{self.chunked_waveform_main_end})"
             )
 
         except Exception as e:
@@ -1293,6 +1379,26 @@ class ESP32Link:
             axis_max_time_ms = max(sample_times) if sample_times else fallback_max
             axis_min_time_ms = min(sample_times) if sample_times else 0.0
 
+            def _sample_to_time_ms(sample_idx):
+                if sample_idx is None:
+                    return None
+                sample_idx = int(sample_idx)
+                tuple_sample = self.chunked_waveform_samples.get(sample_idx)
+                if tuple_sample and tuple_sample[0] is not None and timestamp_count > 0:
+                    pulse_tuple = self.chunked_waveform_samples.get(pulse_start_sample)
+                    pulse_start_time_us = pulse_tuple[0] if (pulse_tuple and pulse_tuple[0] is not None) else tuple_sample[0]
+                    return (tuple_sample[0] - pulse_start_time_us) / 1000.0
+                return (sample_idx - pulse_start_sample) * derived_interval_ms
+
+            phase_meta = {
+                "preheat_start_sample": self.chunked_waveform_preheat_start,
+                "preheat_end_sample": self.chunked_waveform_preheat_end,
+                "gap_start_sample": self.chunked_waveform_gap_start,
+                "gap_end_sample": self.chunked_waveform_gap_end,
+                "main_start_sample": self.chunked_waveform_main_start,
+                "main_end_sample": self.chunked_waveform_main_end,
+            }
+
             payload = {
                 "samples": samples,
                 "count": len(samples),
@@ -1309,6 +1415,13 @@ class ESP32Link:
                     "waveform_format": self.chunked_waveform_format,
                     "received_chunks": self.chunked_waveform_received_chunks,
                     "missing_samples": len(missing_indices),
+                    **phase_meta,
+                    "preheat_start_time_ms": _sample_to_time_ms(self.chunked_waveform_preheat_start),
+                    "preheat_end_time_ms": _sample_to_time_ms(self.chunked_waveform_preheat_end),
+                    "gap_start_time_ms": _sample_to_time_ms(self.chunked_waveform_gap_start),
+                    "gap_end_time_ms": _sample_to_time_ms(self.chunked_waveform_gap_end),
+                    "main_start_time_ms": _sample_to_time_ms(self.chunked_waveform_main_start),
+                    "main_end_time_ms": _sample_to_time_ms(self.chunked_waveform_main_end),
                 },
             }
 
@@ -1471,6 +1584,20 @@ class ESP32Link:
 
             axis_max_time_ms = ((wf_samples - pulse_start_sample) - 1) * WAVEFORM_SAMPLE_INTERVAL_MS
 
+            def _int_meta(name, default=None):
+                raw_v = last_weld_meta.get(name, default)
+                try:
+                    return int(raw_v) if raw_v is not None else None
+                except Exception:
+                    return default
+
+            preheat_start_sample = _int_meta("preheat_start_sample")
+            preheat_end_sample = _int_meta("preheat_end_sample")
+            gap_start_sample = _int_meta("gap_start_sample")
+            gap_end_sample = _int_meta("gap_end_sample")
+            main_start_sample = _int_meta("main_start_sample", pulse_start_sample)
+            main_end_sample = _int_meta("main_end_sample", wf_samples)
+
             payload = {
                 "samples": samples,
                 "count": len(samples),
@@ -1478,8 +1605,21 @@ class ESP32Link:
                 "meta": {
                     "wf_samples": wf_samples,
                     "pulse_start_sample": pulse_start_sample,
+                    "pulse_end_sample": main_end_sample,
                     "axis_max_time_ms": axis_max_time_ms,
                     "sample_interval_ms": WAVEFORM_SAMPLE_INTERVAL_MS,
+                    "preheat_start_sample": preheat_start_sample,
+                    "preheat_end_sample": preheat_end_sample,
+                    "gap_start_sample": gap_start_sample,
+                    "gap_end_sample": gap_end_sample,
+                    "main_start_sample": main_start_sample,
+                    "main_end_sample": main_end_sample,
+                    "preheat_start_time_ms": ((preheat_start_sample - pulse_start_sample) * WAVEFORM_SAMPLE_INTERVAL_MS) if preheat_start_sample is not None else None,
+                    "preheat_end_time_ms": ((preheat_end_sample - pulse_start_sample) * WAVEFORM_SAMPLE_INTERVAL_MS) if preheat_end_sample is not None else None,
+                    "gap_start_time_ms": ((gap_start_sample - pulse_start_sample) * WAVEFORM_SAMPLE_INTERVAL_MS) if gap_start_sample is not None else None,
+                    "gap_end_time_ms": ((gap_end_sample - pulse_start_sample) * WAVEFORM_SAMPLE_INTERVAL_MS) if gap_end_sample is not None else None,
+                    "main_start_time_ms": ((main_start_sample - pulse_start_sample) * WAVEFORM_SAMPLE_INTERVAL_MS) if main_start_sample is not None else None,
+                    "main_end_time_ms": ((main_end_sample - pulse_start_sample) * WAVEFORM_SAMPLE_INTERVAL_MS) if main_end_sample is not None else None,
                 },
             }
             parsed_count = len(samples)
@@ -1536,12 +1676,14 @@ class ESP32Link:
                 last_weld_duration_ms = total_ms
                 last_weld_meta = parsed.copy()
 
-                # Use STM32-provided energy directly when available.
+                # Use STM32-provided weld-tip energy directly when available.
                 # This avoids host-side recomputation mismatch (e.g. 2x when using pack voltage).
-                if "energy_j" in parsed:
+                if "energy_weld_j" in parsed:
+                    joules = float(parsed.get("energy_weld_j", 0.0))
+                elif "energy_j" in parsed:
                     joules = float(parsed.get("energy_j", 0.0))
                 elif v_tips > 0 and total_ms > 0:
-                    # Legacy fallback if firmware omits energy_j but provides tip voltage.
+                    # Legacy fallback if firmware omits energy fields but provides tip voltage.
                     joules = v_tips * avg_a * (total_ms / 1000.0)
                 else:
                     # Last-resort legacy estimate using capacitor voltage.
@@ -1549,14 +1691,78 @@ class ESP32Link:
 
                 voltage_drop = float(parsed.get("delta_v", vcap_b - vcap_a))
 
+                def _float_field(*keys):
+                    for key in keys:
+                        if key not in parsed:
+                            continue
+                        try:
+                            return float(parsed.get(key))
+                        except Exception:
+                            continue
+                    return None
+
+                def _int_field(*keys):
+                    for key in keys:
+                        if key not in parsed:
+                            continue
+                        try:
+                            return int(round(float(parsed.get(key))))
+                        except Exception:
+                            continue
+                    return None
+
+                settings_snapshot = current_settings if isinstance(current_settings, dict) else {}
+
+                try:
+                    preheat_enabled = int(float(parsed.get("preheat_en", settings_snapshot.get("preheat_enabled", 0))))
+                except Exception:
+                    preheat_enabled = 0
+
+                # Configured values (what user set) for UI labels.
+                config_main_ms = _int_field("d1")
+                if config_main_ms is None:
+                    try:
+                        config_main_ms = int(round(float(settings_snapshot.get("d1"))))
+                    except Exception:
+                        config_main_ms = None
+
+                config_preheat_ms = _int_field("preheat_ms")
+                if config_preheat_ms is None:
+                    try:
+                        config_preheat_ms = int(round(float(settings_snapshot.get("preheat_duration"))))
+                    except Exception:
+                        config_preheat_ms = None
+
+                config_gap_ms = _int_field("preheat_gap_ms", "gap1_ms", "gap1")
+                if config_gap_ms is None:
+                    try:
+                        config_gap_ms = int(round(float(settings_snapshot.get("preheat_gap_ms"))))
+                    except Exception:
+                        config_gap_ms = None
+
+                # Keep measured pulse_ms in payload for diagnostics/backward compatibility.
+                pulse_ms = _float_field("pulse_ms", "main_pulse_ms")
+                pulse_us = _float_field("pulse_us", "main_pulse_us")
+                if pulse_ms is None and pulse_us is not None:
+                    pulse_ms = pulse_us / 1000.0
+
                 weld_payload = {
                     "peak_current_amps": float(parsed.get("peak_a", 0.0)),
                     "avg_current_amps": avg_a,
                     "duration_ms": total_ms,
+                    "energy_weld_j": joules,
                     "energy_joules": joules,
                     "vcap_before": vcap_b,
                     "vcap_after": vcap_a,
                     "voltage_drop": voltage_drop,
+                    "preheat_en": preheat_enabled,
+                    "preheat_ms": config_preheat_ms,
+                    "preheat_gap_ms": config_gap_ms,
+                    "pulse_ms": pulse_ms,
+                    "d1": config_main_ms,
+                    "configured_main_ms": config_main_ms,
+                    "configured_preheat_ms": config_preheat_ms,
+                    "configured_gap_ms": config_gap_ms,
                 }
 
                 log(f"🧩 Parsed WELD_DONE: {parsed}")
@@ -1656,41 +1862,13 @@ def api_save_settings():
         })
 
     plan = _build_settings_command_plan(data)
-    results = []
-    failed = []
 
     for item in plan:
-        result = _send_command_with_ack(item["cmd"], item["ack"])
-        ui_ack_payload = {
-            "tx_id": tx_id,
-            "command": item["ack"],
-            "target_fields": item["fields"],
-            "attempts": result.get("attempts", 0),
-            "ok": bool(result.get("ok")),
-            "error": result.get("error"),
-            "ack": result.get("ack"),
-        }
+        esp_link.send_command(item["cmd"])
+        time.sleep(0.03)  # 30ms pacing only
+    # Done. ESP32 will push STATUS back confirming the change.
 
-        if result.get("ok"):
-            socketio.emit("command_ack", ui_ack_payload)
-            results.append(ui_ack_payload)
-        else:
-            failed.append(ui_ack_payload)
-            socketio.emit("command_ack", ui_ack_payload)
-
-    # Ask one STATUS snapshot after batch to converge quickly.
-    esp_link.send_command("STATUS", log_send=False)
-
-    if failed:
-        return jsonify({
-            "status": "partial",
-            "tx_id": tx_id,
-            "message": "Some settings were not acknowledged",
-            "results": results,
-            "failed": failed,
-        }), 207
-
-    return jsonify({"status": "ok", "tx_id": tx_id, "results": results, "failed": []})
+    return jsonify({"status": "ok", "tx_id": tx_id, "results": [], "failed": []})
 @app.route("/api/set_power", methods=["POST"])
 def api_set_power():
     global current_settings
