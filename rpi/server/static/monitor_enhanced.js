@@ -112,7 +112,18 @@ function setText(id, val, decimals) {
 socket.on('weld_complete', function (data) {
     console.log('weld_complete:', data);
 
-    const energyJ = data.energy_weld_j !== undefined ? data.energy_weld_j : (data.energy_joules !== undefined ? data.energy_joules : data.energy_j);
+    const parsedMode = Number(data.mode ?? data.control_mode);
+    const isJouleMode = Number.isFinite(parsedMode) && parsedMode === 1;
+
+    const legacyEnergyJ = data.energy_weld_j !== undefined
+        ? data.energy_weld_j
+        : (data.energy_joules !== undefined ? data.energy_joules : data.energy_j);
+
+    // In joule mode, prefer workpiece energy (what control loop regulates).
+    const energyJ = isJouleMode && data.joule_workpiece_j !== undefined && data.joule_workpiece_j !== null
+        ? data.joule_workpiece_j
+        : legacyEnergyJ;
+
     const vDrop = data.voltage_drop !== undefined
         ? data.voltage_drop
         : (data.vcap_before - data.vcap_after);
@@ -120,6 +131,13 @@ socket.on('weld_complete', function (data) {
     setText('peakCurrent', data.peak_current_amps, 1);
     setText('avgCurrent', data.avg_current_amps, 1);
     setText('energy', energyJ, 2);
+
+    // Optional debug output for joule-mode decomposition.
+    if (isJouleMode) {
+        setText('jouleWorkpiece', data.joule_workpiece_j, 2);
+        setText('jouleTotal', data.joule_total_j, 2);
+        setText('jouleLoss', data.joule_loss_j, 2);
+    }
 
     const configuredMainDurationMs = toConfiguredMs(data.configured_main_ms ?? data.d1);
     if (configuredMainDurationMs !== null) {

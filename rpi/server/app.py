@@ -426,6 +426,18 @@ def _build_settings_command_plan(settings: dict) -> list[dict]:
     d3 = int(settings.get("d3", 0))
     power = int(settings.get("power", 100))
 
+    try:
+        control_mode = int(settings.get("control_mode", 0))
+    except Exception:
+        control_mode = 0
+    control_mode = 1 if control_mode == 1 else 0
+
+    try:
+        joule_target_j = int(round(float(settings.get("joule_target_j", 150))))
+    except Exception:
+        joule_target_j = 150
+    joule_target_j = max(0, min(300, joule_target_j))
+
     pre_en = 1 if bool(settings.get("preheat_enabled", False)) else 0
     pre_ms = int(settings.get("preheat_duration", 20))
     pre_pct = int(settings.get("preheat_power", 30))
@@ -444,6 +456,18 @@ def _build_settings_command_plan(settings: dict) -> list[dict]:
     )
 
     return [
+        {
+            "name": "control_mode",
+            "cmd": f"SET_MODE,{control_mode}",
+            "ack": "SET_MODE",
+            "fields": ["control_mode"],
+        },
+        {
+            "name": "joule_target",
+            "cmd": f"SET_JOULE_TARGET,{joule_target_j}",
+            "ack": "SET_JOULE_TARGET",
+            "fields": ["joule_target_j"],
+        },
         {
             "name": "pulse",
             "cmd": f"SET_PULSE,{mode},{d1},{gap1},{d2},{gap2},{d3}",
@@ -497,6 +521,21 @@ def load_settings() -> dict:
                 settings["contact_hold_steps"] = 2
             if "lead_resistance_mohm" not in settings:
                 settings["lead_resistance_mohm"] = LEAD_RESISTANCE_DEFAULT_MOHM
+            if "control_mode" not in settings:
+                settings["control_mode"] = 0
+            if "joule_target_j" not in settings:
+                settings["joule_target_j"] = 150
+
+            try:
+                settings_control_mode = int(settings.get("control_mode", 0))
+            except Exception:
+                settings_control_mode = 0
+            settings["control_mode"] = 1 if settings_control_mode == 1 else 0
+            try:
+                settings["joule_target_j"] = int(round(float(settings.get("joule_target_j", 150))))
+            except Exception:
+                settings["joule_target_j"] = 150
+            settings["joule_target_j"] = max(0, min(300, settings["joule_target_j"]))
 
             settings["lead_resistance_mohm"] = _normalize_lead_resistance_mohm(
                 settings.get("lead_resistance_mohm", LEAD_RESISTANCE_DEFAULT_MOHM)
@@ -522,6 +561,8 @@ def load_settings() -> dict:
         "trigger_mode": "pedal",
         "contact_hold_steps": 2,
         "lead_resistance_mohm": LEAD_RESISTANCE_DEFAULT_MOHM,
+        "control_mode": 0,
+        "joule_target_j": 150,
     }
 
 
@@ -1872,12 +1913,32 @@ class ESP32Link:
                 if pulse_ms is None and pulse_us is not None:
                     pulse_ms = pulse_us / 1000.0
 
+                control_mode = _int_field("mode", "control_mode")
+                if control_mode is None:
+                    try:
+                        control_mode = int(round(float(settings_snapshot.get("mode", 0))))
+                    except Exception:
+                        control_mode = 0
+
+                # Joule-mode telemetry from STM32 WELD_DONE.
+                # - joule_workpiece_j: compensated workpiece energy (control target)
+                # - joule_total_j: total integrated energy including leads/circuit
+                # - joule_loss_j: estimated non-workpiece loss
+                joule_workpiece_j = _float_field("joule_workpiece_j")
+                joule_total_j = _float_field("joule_total_j")
+                joule_loss_j = _float_field("joule_loss_j")
+
                 weld_payload = {
+                    "mode": control_mode,
+                    "control_mode": control_mode,
                     "peak_current_amps": float(parsed.get("peak_a", 0.0)),
                     "avg_current_amps": avg_a,
                     "duration_ms": total_ms,
                     "energy_weld_j": joules,
                     "energy_joules": joules,
+                    "joule_workpiece_j": joule_workpiece_j,
+                    "joule_total_j": joule_total_j,
+                    "joule_loss_j": joule_loss_j,
                     "vcap_before": vcap_b,
                     "vcap_after": vcap_a,
                     "voltage_drop": voltage_drop,
@@ -1964,6 +2025,21 @@ def api_save_settings():
         data["contact_hold_steps"] = 2
     if "lead_resistance_mohm" not in data:
         data["lead_resistance_mohm"] = LEAD_RESISTANCE_DEFAULT_MOHM
+    if "control_mode" not in data:
+        data["control_mode"] = 0
+    if "joule_target_j" not in data:
+        data["joule_target_j"] = 150
+
+    try:
+        data_control_mode = int(data.get("control_mode", 0))
+    except Exception:
+        data_control_mode = 0
+    data["control_mode"] = 1 if data_control_mode == 1 else 0
+    try:
+        data["joule_target_j"] = int(round(float(data.get("joule_target_j", 150))))
+    except Exception:
+        data["joule_target_j"] = 150
+    data["joule_target_j"] = max(0, min(300, data["joule_target_j"]))
 
     data["lead_resistance_mohm"] = _normalize_lead_resistance_mohm(
         data.get("lead_resistance_mohm", LEAD_RESISTANCE_DEFAULT_MOHM)

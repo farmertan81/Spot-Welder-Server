@@ -1,17 +1,19 @@
 {
   "mode": 1,
-  "d1": 10,
+  "d1": 20,
   "gap1": 1,
   "d2": 1,
   "gap2": 1,
   "d3": 1,
   "active_preset": null,
+  "control_mode": 1,
+  "joule_target_j": 50,
   "power": 100,
   "preheat_enabled": false,
   "preheat_duration": 20,
   "preheat_power": 50,
   "preheat_gap_ms": 5,
-  "trigger_mode": "pedal",
+  "trigger_mode": "contact",
   "contact_hold_steps": 2,
   "lead_resistance_mohm": 2.0
 }
