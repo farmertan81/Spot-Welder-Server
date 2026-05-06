@@ -1561,48 +1561,62 @@
                 });
         }
 
-        const VPACK_DISPLAY_DEADBAND_V = 0.01;
-        let lastDisplayedVpack = null;
-        let pendingVpackDisplayValue = null;
-        let vpackDisplayRafHandle = null;
-
-        function flushVpackDisplayUpdate() {
-            vpackDisplayRafHandle = null;
-            if (pendingVpackDisplayValue === null) return;
-
-            const vpackEl = document.getElementById('vpack');
-            if (!vpackEl) {
-                pendingVpackDisplayValue = null;
-                return;
+        /**
+         * DISPLAY-ONLY VOLTAGE SMOOTHER
+         * Prevents UI label flicker while keeping raw data for graphs/calculations.
+         * Threshold default: 20mV.
+         */
+        class VoltageDisplaySmoother {
+            constructor(threshold = 0.02) {
+                this.lastDisplayValues = {};
+                this.threshold = threshold;
             }
 
-            const displayValue = pendingVpackDisplayValue;
-            pendingVpackDisplayValue = null;
-            vpackEl.textContent = `${displayValue.toFixed(2)} V`;
-            lastDisplayedVpack = displayValue;
+            getDisplayValue(key, rawValue) {
+                if (typeof rawValue !== 'number' || !Number.isFinite(rawValue)) {
+                    return rawValue;
+                }
+
+                if (!(key in this.lastDisplayValues)) {
+                    this.lastDisplayValues[key] = rawValue;
+                    return rawValue;
+                }
+
+                const delta = Math.abs(rawValue - this.lastDisplayValues[key]);
+                if (delta < this.threshold) {
+                    return this.lastDisplayValues[key];
+                }
+
+                this.lastDisplayValues[key] = rawValue;
+                return rawValue;
+            }
         }
 
-        function scheduleVpackDisplayUpdate(nextVpack) {
-            if (typeof nextVpack !== 'number' || !Number.isFinite(nextVpack)) return;
+        // Global smoother for label rendering only.
+        // Raw values are still used for calculations/telemetry paths.
+        const voltageDisplaySmoother = new VoltageDisplaySmoother(0.02);
 
-            if (
-                typeof lastDisplayedVpack === 'number' &&
-                Number.isFinite(lastDisplayedVpack) &&
-                Math.abs(nextVpack - lastDisplayedVpack) <= VPACK_DISPLAY_DEADBAND_V
-            ) {
-                return;
+        function pickRawVoltage(data, keys) {
+            for (const key of keys) {
+                if (typeof data[key] === 'number' && Number.isFinite(data[key])) {
+                    return data[key];
+                }
             }
-
-            pendingVpackDisplayValue = nextVpack;
-            if (vpackDisplayRafHandle !== null) return;
-            vpackDisplayRafHandle = window.requestAnimationFrame(flushVpackDisplayUpdate);
+            return null;
         }
 
         socket.on('status_update', (data) => {
             console.log('📊 Status Update:', data);
             console.log('STATUS received, active drags:', Array.from(sliderDragState.activeDrags));
 
-            scheduleVpackDisplayUpdate(data.vpack);
+            // RAW telemetry path: data.* remains untouched for logic/calculation paths.
+            // DISPLAY path: only text labels use smoothed values.
+            const rawVpack = pickRawVoltage(data, ['vpack']);
+            if (rawVpack !== null) {
+                const displayVpack = voltageDisplaySmoother.getDisplayValue('vpack', rawVpack);
+                const vpackEl = document.getElementById('vpack');
+                if (vpackEl) vpackEl.textContent = `${displayVpack.toFixed(2)} V`;
+            }
 
             const t = (typeof data.temp === 'number') ? data.temp
                 : (typeof data.temperature === 'number') ? data.temperature
@@ -1616,9 +1630,22 @@
                 document.getElementById('counter').textContent = data.weld_count;
             }
 
-            if (typeof data.C1 === 'number') document.getElementById('c1').textContent = data.C1.toFixed(2) + 'V';
-            if (typeof data.C2 === 'number') document.getElementById('c2').textContent = data.C2.toFixed(2) + 'V';
-            if (typeof data.C3 === 'number') document.getElementById('c3').textContent = data.C3.toFixed(2) + 'V';
+            const rawCell1 = pickRawVoltage(data, ['cell1', 'cell_1', 'C1']);
+            const rawCell2 = pickRawVoltage(data, ['cell2', 'cell_2', 'C2']);
+            const rawCell3 = pickRawVoltage(data, ['cell3', 'cell_3', 'C3']);
+
+            if (rawCell1 !== null) {
+                const displayCell1 = voltageDisplaySmoother.getDisplayValue('cell1', rawCell1);
+                document.getElementById('c1').textContent = displayCell1.toFixed(2) + 'V';
+            }
+            if (rawCell2 !== null) {
+                const displayCell2 = voltageDisplaySmoother.getDisplayValue('cell2', rawCell2);
+                document.getElementById('c2').textContent = displayCell2.toFixed(2) + 'V';
+            }
+            if (rawCell3 !== null) {
+                const displayCell3 = voltageDisplaySmoother.getDisplayValue('cell3', rawCell3);
+                document.getElementById('c3').textContent = displayCell3.toFixed(2) + 'V';
+            }
 
             if ('esp_connected' in data) {
                 setConnectionIndicator(!!data.esp_connected);

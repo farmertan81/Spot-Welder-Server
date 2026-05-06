@@ -45,9 +45,9 @@ HEARTBEAT_INTERVAL_S = 5.0  # Send PING every 5 seconds to keep connection alive
 # Values below this threshold are treated as 0.0A to suppress phantom flashes.
 STATUS2_CHARGE_NOISE_THRESHOLD_A = 0.2
 
-# Deadband for pack voltage display smoothing (STATUS2 INA226 telemetry).
-# UI voltage is only allowed to move if absolute change exceeds this threshold.
-STATUS2_VPACK_DEADBAND_V = 0.08
+# IMPORTANT (dual-path telemetry design):
+# Voltage values in STATUS2 stay RAW end-to-end on the server.
+# Any visual anti-flicker smoothing must happen only at the final UI render layer.
 
 # If your ESP supports a "CELLS" command, keep True. Otherwise set False.
 REQUEST_CELLS_ON_CONNECT = True
@@ -1149,39 +1149,12 @@ class ESP32Link:
                         except Exception:
                             pass
 
-                # 2. Deadband filter for pack-voltage AND cell-voltage display smoothing.
-                # We map keys to their specific deadband thresholds.
-                smoothing_map = {
-                    "vpack": 0.06,  # 60mV jitter filter
-                    "cell1": 0.015, # 15mV jitter filter (kills 2.97<->2.98 bounce)
-                    "cell2": 0.015,
-                    "cell3": 0.015,
-                    "vlow":  0.015,
-                    "vmid":  0.015
-                }
-
-                # Initialize tracking dict if not exists
-                if not hasattr(self, 'last_emitted_values'):
-                    self.last_emitted_values = {}
-
-                for key, threshold in smoothing_map.items():
-                    if key in parsed:
-                        try:
-                            new_val = float(parsed[key])
-                            last_val = self.last_emitted_values.get(key)
-
-                            if last_val is None:
-                                self.last_emitted_values[key] = new_val
-                            elif abs(new_val - last_val) <= threshold:
-                                # WITHIN DEADBAND: Use the last value to stop the flicker
-                                parsed[key] = last_val
-                                # CRITICAL: We don't update last_emitted_values here
-                                # so that the 'anchor' stays solid until a real move occurs.
-                            else:
-                                # SIGNIFICANT MOVE: Update the anchor and allow the value
-                                self.last_emitted_values[key] = new_val
-                        except Exception:
-                            pass
+                # 2. RAW DATA PATH (intentional):
+                # Do NOT deadband/smooth voltages in backend parsing.
+                # Keeping vpack/cell/vlow/vmid unfiltered here ensures:
+                #   - waveform/graph layers consume raw telemetry
+                #   - calculations/alerts use true live values
+                #   - only frontend display labels apply anti-flicker smoothing
 
                 # 3. Dialect alignment aliases
                 cell_aliases = {
