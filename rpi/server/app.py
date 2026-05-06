@@ -952,6 +952,9 @@ class ESP32Link:
             elif line.startswith("CELLS,"):
                 log("🧭 Routing packet -> _parse_cells")
                 self._parse_cells(line[6:])
+            elif line.startswith("DISPLAY,"):
+                log("🧭 Routing packet -> _parse_display")
+                self._parse_display(line)
             elif line.startswith("STATUS2,"):
                 log("🧭 Routing packet -> _parse_status2")
                 self._parse_status2(line[8:])
@@ -1123,6 +1126,28 @@ class ESP32Link:
                 emit_status_update({})
         except Exception as e:
             log(f"⚠️ Failed to parse CHARGER: {e}")
+
+    def _parse_display(self, packet: str) -> dict:
+            """
+            Parse DISPLAY packet (smoothed voltages for UI labels).
+            Sent at 1Hz from ESP32 with 5mV threshold.
+            """
+            data = {}
+            try:
+                parts = packet.split(",")
+                for part in parts[1:]:  # Skip DISPLAY prefix
+                    if "=" in part:
+                        key, val = part.split("=", 1)
+                        try:
+                            data[key.strip()] = float(val.strip())
+                        except Exception:
+                            pass
+
+                socketio.emit("display_update", data)
+                return data
+            except Exception as e:
+                log(f"⚠️ Failed to parse DISPLAY: {e}")
+                return data
 
     def _parse_status2(self, data: str) -> None:
             """Parse STATUS2,<k=v,...> for INA226 telemetry and cell details."""
