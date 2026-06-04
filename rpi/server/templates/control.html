@@ -239,6 +239,148 @@
             background: #66BB6A;
         }
 
+        /* ===== Lead Resistance Calibration ===== */
+        .cal-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .cal-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.75);
+            z-index: 9999;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+        }
+
+        .cal-overlay.open {
+            display: flex;
+        }
+
+        .cal-dialog {
+            background: #2a2a2a;
+            border-radius: 10px;
+            padding: 24px;
+            max-width: 480px;
+            width: 100%;
+            box-shadow: 0 8px 28px rgba(0, 0, 0, 0.6);
+            border: 1px solid #3a3a3a;
+        }
+
+        .cal-dialog h2 {
+            margin-bottom: 14px;
+            color: #ff6b35;
+            font-size: 1.3em;
+        }
+
+        .cal-dialog h2.ok {
+            color: #4CAF50;
+        }
+
+        .cal-dialog h2.err {
+            color: #ff4d4f;
+        }
+
+        .cal-box {
+            background: #1f1f1f;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 16px 0;
+        }
+
+        .cal-box ol {
+            margin: 6px 0 0 18px;
+            color: #bbb;
+            line-height: 1.8;
+        }
+
+        .cal-volt-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .cal-volt-label {
+            color: #aaa;
+        }
+
+        .cal-volt-value {
+            color: #ff6b35;
+            font-weight: bold;
+            font-size: 1.2em;
+        }
+
+        .cal-volt-value.ok {
+            color: #4CAF50;
+        }
+
+        .cal-volt-value.low {
+            color: #FF9800;
+        }
+
+        .cal-btn-row {
+            display: flex;
+            gap: 10px;
+            margin-top: 22px;
+        }
+
+        .cal-btn-row .btn {
+            flex: 1;
+        }
+
+        .cal-result-value {
+            color: #ff6b35;
+            font-size: 2em;
+            font-weight: bold;
+            text-align: center;
+        }
+
+        .cal-compare {
+            display: flex;
+            justify-content: space-around;
+            padding-top: 14px;
+            margin-top: 14px;
+            border-top: 1px solid #3a3a3a;
+        }
+
+        .cal-compare .label {
+            color: #888;
+            font-size: 0.8em;
+        }
+
+        .cal-compare .val {
+            color: #ccc;
+            font-size: 1.15em;
+            margin-top: 4px;
+        }
+
+        .cal-success-note {
+            text-align: center;
+            color: #4CAF50;
+            font-size: 0.9em;
+            margin-bottom: 16px;
+        }
+
+        .cal-spinner {
+            border: 4px solid #333;
+            border-top: 4px solid #ff6b35;
+            border-radius: 50%;
+            width: 56px;
+            height: 56px;
+            animation: cal-spin 1s linear infinite;
+            margin: 0 auto 18px;
+        }
+
+        @keyframes cal-spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
         .presets {
             display: grid;
             grid-template-columns: repeat(5, 1fr);
@@ -602,6 +744,19 @@
                     <button class="btn btn-secondary" style="width: 72px; padding: 6px 10px; font-size: 0.85em;"
                         onclick="savePreset()">Save</button>
                 </div>
+
+                <!-- Lead Resistance Calibration Panel -->
+                <div class="panel" style="margin-top: 16px;">
+                    <h2>Lead Calibration</h2>
+                    <div class="cal-actions">
+                        <button class="btn btn-primary" id="calibrateBtn" onclick="openCalibration()">🔧 Auto
+                            Calibrate</button>
+                        <span id="calStatus" class="inline-note" style="min-height: 18px;"></span>
+                    </div>
+                    <div class="inline-note" style="margin-top: 8px;">
+                        Automatically measures lead resistance for accurate Joule-mode compensation.
+                    </div>
+                </div>
             </div>
 
             <div>
@@ -785,6 +940,91 @@
         </div>
 
         <div id="pulse-flash" class="pulse-flash">WELD</div>
+    </div>
+
+    <!-- Lead Resistance Calibration Modal -->
+    <div id="calModal" class="cal-overlay">
+        <div class="cal-dialog">
+            <!-- Instructions / pre-flight screen -->
+            <div id="calScreenInstructions">
+                <h2>Lead Resistance Calibration</h2>
+                <div class="cal-box">
+                    <strong style="color:#ccc;">Before you start:</strong>
+                    <ol>
+                        <li>Firmly short the weld tips together.</li>
+                        <li>Ensure the supercaps are charged (8&nbsp;V+ recommended).</li>
+                        <li>Click START to run a short test pulse.</li>
+                        <li>The measured resistance is saved and synced automatically.</li>
+                    </ol>
+                </div>
+                <div class="cal-box">
+                    <div class="cal-volt-row">
+                        <span class="cal-volt-label">Supercap Voltage</span>
+                        <span id="calVoltage" class="cal-volt-value">-- V</span>
+                    </div>
+                    <div id="calVoltageHint" class="inline-note" style="margin-top:8px; display:none;"></div>
+                </div>
+                <div class="cal-btn-row">
+                    <button class="btn btn-primary" id="calStartBtn" onclick="startCalibration(false)">START</button>
+                    <button class="btn btn-secondary" style="background:#555;" onclick="closeCalibration()">CANCEL</button>
+                </div>
+            </div>
+
+            <!-- Progress screen -->
+            <div id="calScreenProgress" style="display:none;">
+                <h2>Calibrating…</h2>
+                <div style="text-align:center; padding:30px 10px;">
+                    <div class="cal-spinner"></div>
+                    <p id="calProgressText" style="color:#aaa;">Running test pulse and measuring…</p>
+                </div>
+            </div>
+
+            <!-- Results screen -->
+            <div id="calScreenResults" style="display:none;">
+                <h2 class="ok">✓ Calibration Complete</h2>
+                <div class="cal-box">
+                    <div class="label" style="text-align:center; color:#888; font-size:0.85em;">New Lead Resistance</div>
+                    <div id="calResultValue" class="cal-result-value">-- mΩ</div>
+                    <div class="cal-compare">
+                        <div style="text-align:center;">
+                            <div class="label">Previous</div>
+                            <div id="calOldValue" class="val">-- mΩ</div>
+                        </div>
+                        <div style="text-align:center;">
+                            <div class="label">Change</div>
+                            <div id="calChangeValue" class="val">--</div>
+                        </div>
+                    </div>
+                </div>
+                <div id="calHwNote" class="cal-success-note">✓ Saved to settings and synced to hardware.</div>
+                <div class="cal-btn-row">
+                    <button class="btn btn-primary" onclick="closeCalibration()">DONE</button>
+                </div>
+            </div>
+
+            <!-- Warning screen (low voltage, can proceed) -->
+            <div id="calScreenWarning" style="display:none;">
+                <h2 style="color:#FF9800;">⚠ Low Voltage</h2>
+                <div class="cal-box">
+                    <p id="calWarnMessage" style="color:#ffcf99; margin:0;"></p>
+                </div>
+                <div class="cal-btn-row">
+                    <button class="btn btn-primary" onclick="startCalibration(true)">PROCEED ANYWAY</button>
+                    <button class="btn btn-secondary" style="background:#555;" onclick="closeCalibration()">CANCEL</button>
+                </div>
+            </div>
+
+            <!-- Error screen -->
+            <div id="calScreenError" style="display:none;">
+                <h2 class="err">❌ Calibration Failed</h2>
+                <div class="cal-box">
+                    <p id="calErrorMessage" style="color:#ff9a9a; margin:0;"></p>
+                </div>
+                <div class="cal-btn-row">
+                    <button class="btn btn-secondary" style="background:#555;" onclick="closeCalibration()">CLOSE</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -1732,6 +1972,189 @@
             setConnectionIndicator(false);
             loadSettings();
             loadPresets();
+        });
+
+        // ===== Lead Resistance Calibration =====
+        let calLatestVpack = null;
+        let calInProgress = false;
+
+        function calShowScreen(name) {
+            const screens = {
+                instructions: 'calScreenInstructions',
+                progress: 'calScreenProgress',
+                results: 'calScreenResults',
+                warning: 'calScreenWarning',
+                error: 'calScreenError',
+            };
+            Object.entries(screens).forEach(([key, id]) => {
+                const el = document.getElementById(id);
+                if (el) el.style.display = (key === name) ? 'block' : 'none';
+            });
+        }
+
+        function calUpdateVoltageDisplay() {
+            const el = document.getElementById('calVoltage');
+            const hint = document.getElementById('calVoltageHint');
+            if (!el) return;
+            if (calLatestVpack === null || !Number.isFinite(calLatestVpack)) {
+                el.textContent = '-- V';
+                el.className = 'cal-volt-value';
+                if (hint) hint.style.display = 'none';
+                return;
+            }
+            el.textContent = `${calLatestVpack.toFixed(2)} V`;
+            const ok = calLatestVpack >= 8.0;
+            el.className = 'cal-volt-value ' + (ok ? 'ok' : 'low');
+            if (hint) {
+                if (ok) {
+                    hint.style.display = 'none';
+                } else {
+                    hint.style.display = 'block';
+                    hint.textContent = 'Below 8 V — charge up for best accuracy.';
+                }
+            }
+        }
+
+        // Track latest pack voltage from both telemetry streams.
+        socket.on('display_update', (data) => {
+            if (data && typeof data.vpack === 'number' && Number.isFinite(data.vpack)) {
+                calLatestVpack = data.vpack;
+                calUpdateVoltageDisplay();
+            }
+        });
+        socket.on('status_update', (data) => {
+            if (!data) return;
+            const v = (typeof data.vpack === 'number') ? data.vpack
+                : (typeof data.vcap === 'number') ? data.vcap : null;
+            if (v !== null && Number.isFinite(v)) {
+                calLatestVpack = v;
+                calUpdateVoltageDisplay();
+            }
+        });
+
+        // Live progress messages from the backend (CAL_STATUS / completion).
+        socket.on('calibration_update', (data) => {
+            if (!data) return;
+            const txt = document.getElementById('calProgressText');
+            if (data.status === 'progress' && data.message && txt) {
+                txt.textContent = data.message;
+            }
+        });
+
+        function openCalibration() {
+            calShowScreen('instructions');
+            calUpdateVoltageDisplay();
+            document.getElementById('calModal').classList.add('open');
+        }
+
+        function closeCalibration() {
+            if (calInProgress) return; // don't allow close mid-pulse
+            document.getElementById('calModal').classList.remove('open');
+            setCalStatus('');
+        }
+
+        function setCalStatus(msg, color) {
+            const el = document.getElementById('calStatus');
+            if (!el) return;
+            el.textContent = msg || '';
+            el.style.color = color || '';
+        }
+
+        async function startCalibration(force) {
+            calInProgress = true;
+            calShowScreen('progress');
+            const txt = document.getElementById('calProgressText');
+            if (txt) txt.textContent = 'Running test pulse and measuring…';
+            setCalStatus('Calibrating…', '#ff6b35');
+
+            // Capture the previous value for the before/after comparison.
+            const leadInput = document.getElementById('leadResistance');
+            const oldValue = leadInput ? parseFloat(leadInput.value) : NaN;
+
+            let resp, result;
+            try {
+                resp = await fetch('/api/calibrate_lead_r', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ force: !!force }),
+                });
+                result = await resp.json();
+            } catch (err) {
+                calInProgress = false;
+                document.getElementById('calErrorMessage').textContent =
+                    'Network error: ' + (err && err.message ? err.message : err);
+                calShowScreen('error');
+                setCalStatus('✗ Error', '#ff4d4f');
+                return;
+            }
+
+            calInProgress = false;
+
+            if (result && result.status === 'success') {
+                const newValue = Number(result.resistance_milliohms);
+
+                document.getElementById('calResultValue').textContent = newValue.toFixed(3) + ' mΩ';
+                document.getElementById('calOldValue').textContent =
+                    Number.isFinite(oldValue) ? oldValue.toFixed(3) + ' mΩ' : '--';
+
+                const changeEl = document.getElementById('calChangeValue');
+                if (Number.isFinite(oldValue)) {
+                    const change = newValue - oldValue;
+                    changeEl.textContent = (change >= 0 ? '+' : '') + change.toFixed(3) + ' mΩ';
+                    changeEl.style.color = Math.abs(change) < 0.05 ? '#ccc'
+                        : (change > 0 ? '#ff9a9a' : '#4CAF50');
+                } else {
+                    changeEl.textContent = '--';
+                    changeEl.style.color = '#ccc';
+                }
+
+                const hwNote = document.getElementById('calHwNote');
+                if (result.hardware_ack) {
+                    hwNote.textContent = '✓ Saved to settings and synced to hardware.';
+                    hwNote.style.color = '#4CAF50';
+                } else {
+                    hwNote.textContent = '⚠ Saved to settings, but hardware did not acknowledge SET_LEAD_R.';
+                    hwNote.style.color = '#FF9800';
+                }
+
+                // Reflect the calibrated value in the input, reusing the lead-R guard
+                // so incoming STATUS telemetry doesn't overwrite it before the user sees it.
+                if (leadInput) {
+                    leadInput.value = newValue.toFixed(2);
+                    if (typeof markLeadRUserEdited === 'function') markLeadRUserEdited();
+                    if (typeof clearLeadRUserEdited === 'function') {
+                        // value is already persisted server-side; clear the "unsaved" flag.
+                        clearLeadRUserEdited();
+                    }
+                }
+                const liveEl = document.getElementById('leadResistanceLive');
+                if (liveEl) liveEl.textContent = `Current STM32: ${newValue.toFixed(3)} mΩ`;
+
+                calShowScreen('results');
+                setCalStatus('✓ Calibrated', '#4CAF50');
+
+            } else if (result && result.status === 'warning') {
+                document.getElementById('calWarnMessage').textContent =
+                    result.message || 'Pack voltage is low. Accuracy may be reduced.';
+                calShowScreen('warning');
+                setCalStatus('⚠ Low voltage', '#FF9800');
+
+            } else {
+                const msg = (result && result.message) ? result.message : 'Calibration failed.';
+                document.getElementById('calErrorMessage').textContent = msg;
+                calShowScreen('error');
+                setCalStatus('✗ Failed', '#ff4d4f');
+            }
+        }
+
+        // Close modal when clicking the dimmed backdrop (but not while pulsing).
+        document.addEventListener('DOMContentLoaded', () => {
+            const modal = document.getElementById('calModal');
+            if (modal) {
+                modal.addEventListener('click', (e) => {
+                    if (e.target === modal) closeCalibration();
+                });
+            }
         });
     </script>
 </body>
