@@ -955,10 +955,10 @@
                         <li>Click START, then trigger the test pulse:</li>
                     </ol>
                     <div style="margin:10px 0 2px; padding:10px 12px; background:#161616; border-radius:6px;">
-                        <div style="color:#ddd;">Short the weld tips together <strong>OR</strong> press the pedal</div>
+                        <div style="color:#ddd;">Trigger the test pulse the same way you weld</div>
                         <div style="font-size:13px; color:#888; margin-top:6px; line-height:1.5;">
-                            • <strong style="color:#aaa;">Contact:</strong> 2&nbsp;second delay (for a firm grip), then fires<br>
-                            • <strong style="color:#aaa;">Pedal:</strong> fires immediately
+                            Uses your configured trigger (contact or pedal). Short the
+                            weld tips together — or press the pedal — to fire the pulse.
                         </div>
                     </div>
                     <div style="font-size:13px; color:#888; margin-top:8px;">
@@ -2042,10 +2042,8 @@
 
         // Friendly text for each CAL_STATUS value emitted by the STM32.
         const CAL_STATUS_TEXT = {
-            'WAITING_FOR_TRIGGER': 'Waiting for contact or pedal…',
-            'CONTACT_DETECTED': 'Contact detected — hold the tips together firmly…',
-            'WAITING_2SEC': 'Hold steady… firing test pulse in 2 seconds',
-            'PEDAL_PRESSED': 'Pedal pressed — firing test pulse…',
+            'WAITING_FOR_TRIGGER': 'Waiting for trigger (contact or pedal)…',
+            'TRIGGER_DETECTED': 'Trigger detected — firing test pulse…',
             'MEASURING': 'Running test pulse and measuring…',
             'CHARGING': 'Charging capacitors…',
         };
