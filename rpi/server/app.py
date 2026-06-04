@@ -63,6 +63,18 @@ LEAD_RESISTANCE_DEFAULT_MOHM = 1.87
 LEAD_RESISTANCE_MIN_MOHM = 0.10
 LEAD_RESISTANCE_MAX_MOHM = 10.00
 
+# ---- Lead-resistance auto-calibration (Phase 1: Flask backend) ----
+# Command sent to the STM32 (via the ESP32 bridge) to start a calibration pulse.
+CAL_LEAD_COMMAND = "CAL_LEAD_START"
+# Total time to wait for the STM32 to run the test pulse and report a result.
+CAL_RESULT_TIMEOUT_S = 12.0
+# Recommended minimum supercap pack voltage for an accurate measurement.
+CAL_MIN_VOLTAGE_V = 8.0
+# Plausibility band for a *measured* lead resistance (slightly wider than the
+# manual-entry clamp to leave measurement headroom). Values outside are rejected.
+CAL_RESISTANCE_MIN_MOHM = 0.05
+CAL_RESISTANCE_MAX_MOHM = 20.00
+
 # Waveform fallback sample interval (used when payload has no explicit timestamps).
 WAVEFORM_SAMPLE_INTERVAL_MS = 0.1
 DEFAULT_PULSE_START_SAMPLE = 10
@@ -86,6 +98,10 @@ _ack_lock = threading.Lock()
 _ack_waiters: dict[str, deque] = defaultdict(deque)
 _deny_lock = threading.Lock()
 _deny_waiters: dict[str, deque] = defaultdict(deque)
+
+# Calibration wait-notify bridge (single-flight; CAL_RESULT/CAL_ERROR from STM32).
+_cal_lock = threading.Lock()
+_cal_waiters: list[dict] = []
 
 
 # ========== LOGGING ==========
@@ -337,6 +353,112 @@ def _notify_deny_waiters(payload: dict) -> None:
     waiter["payload"] = payload
     waiter["event"].set()
     log(f"⛔ DENY detected and matched waiter: command={command} payload={payload}")
+
+
+# ========== CALIBRATION WAIT-NOTIFY BRIDGE ==========
+def _register_cal_waiter() -> dict:
+    """Register a waiter for the next calibration result (CAL_RESULT/CAL_ERROR)."""
+    event = threading.Event()
+    waiter = {"event": event, "payload": None}
+    with _cal_lock:
+        _cal_waiters.append(waiter)
+    return waiter
+
+
+def _remove_cal_waiter(waiter: dict) -> None:
+    with _cal_lock:
+        if waiter in _cal_waiters:
+            _cal_waiters.remove(waiter)
+
+
+def _notify_cal_waiters(payload: dict) -> None:
+    """Resolve all pending calibration waiters with the terminal payload."""
+    with _cal_lock:
+        waiters = list(_cal_waiters)
+        _cal_waiters.clear()
+
+    if not waiters:
+        log(f"🔎 Calibration response received but no waiter is registered: {payload}")
+        return
+
+    for waiter in waiters:
+        waiter["payload"] = payload
+        waiter["event"].set()
+    log(f"✅ Calibration response matched waiter(s): {payload}")
+
+
+def _parse_calibration_line(line: str) -> dict | None:
+    """Parse a CAL_* line emitted by the STM32.
+
+    Tolerates either '=' or ',' as the tag separator, e.g.:
+        CAL_RESULT=0.002850            (resistance in Ohms)
+        CAL_RESULT,0.002850
+        CAL_RESULT,r_ohm=0.002850
+        CAL_RESULT,r_mohm=2.85
+        CAL_ERROR=VOLTAGE_LOW
+        CAL_STATUS=charging            (progress; not terminal)
+
+    Returns a structured payload, or None if the line is not a CAL_* line.
+    """
+    if not line:
+        return None
+
+    s = line.strip()
+    if not s.startswith("CAL_"):
+        return None
+
+    # Separate the tag (CAL_RESULT / CAL_ERROR / CAL_STATUS) from the remainder.
+    tag, rest = s, ""
+    sep_idx = min(
+        [i for i in (s.find("="), s.find(",")) if i >= 0],
+        default=-1,
+    )
+    if sep_idx >= 0:
+        tag = s[:sep_idx].strip()
+        rest = s[sep_idx + 1:].strip()
+
+    tag = tag.upper()
+    payload = {"raw": line, "tag": tag, "timestamp_ms": int(time.time() * 1000)}
+
+    if tag == "CAL_RESULT":
+        ohms = None
+        # Try a bare float first (most common: "CAL_RESULT=0.002850").
+        try:
+            ohms = float(rest)
+        except Exception:
+            # Otherwise parse key=value tokens for r_ohm / r_mohm style fields.
+            for tok in rest.split(","):
+                if "=" not in tok:
+                    continue
+                key, value = tok.split("=", 1)
+                key = key.strip().lower()
+                value = value.strip()
+                try:
+                    fval = float(value)
+                except Exception:
+                    continue
+                if key in ("r_ohm", "ohm", "ohms", "r", "resistance", "resistance_ohms"):
+                    ohms = fval
+                elif key in ("r_mohm", "mohm", "milliohm", "milliohms", "resistance_mohm"):
+                    ohms = fval / 1000.0
+        payload["status"] = "success"
+        payload["resistance_ohms"] = ohms
+        return payload
+
+    if tag == "CAL_ERROR":
+        payload["status"] = "error"
+        payload["error"] = rest or "UNKNOWN"
+        payload["message"] = f"STM32 reported calibration error: {rest or 'UNKNOWN'}"
+        return payload
+
+    if tag == "CAL_STATUS":
+        payload["status"] = "progress"
+        payload["message"] = rest
+        return payload
+
+    payload["status"] = "unknown"
+    payload["message"] = rest
+    return payload
 
 
 def _send_command_with_ack(cmd: str, ack_command: str, timeout_s: float = SETTINGS_ACK_TIMEOUT_S,
@@ -1039,6 +1161,20 @@ class ESP32Link:
                     return
                 log("🧭 Routing packet -> _parse_waveform (legacy)")
                 self._parse_waveform(line)
+            elif line.startswith("CAL_"):
+                cal_payload = _parse_calibration_line(line)
+                if cal_payload is None:
+                    log(f"⚠️ CAL-like line could not be parsed: {line}")
+                    socketio.emit("esp32_message", {"message": line})
+                else:
+                    cstatus = cal_payload.get("status")
+                    log(f"🧭 Routing packet -> calibration handler "
+                        f"({cal_payload.get('tag')}, {cstatus})")
+                    # Always surface to the UI for live feedback.
+                    socketio.emit("calibration_update", cal_payload)
+                    # Progress (CAL_STATUS) does not complete the wait; results/errors do.
+                    if cstatus in ("success", "error", "unknown"):
+                        _notify_cal_waiters(cal_payload)
             elif line.startswith("EVENT,"):
                 log("🧭 Routing packet -> _parse_event")
                 self._parse_event(line[6:])
@@ -2246,6 +2382,203 @@ def api_charge_off():
         esp_link.send_command("CHARGE_OFF")
         return jsonify({"status": "ok"})
     return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
+
+
+# ========== LEAD-RESISTANCE AUTO-CALIBRATION ==========
+def _current_pack_voltage() -> float | None:
+    """Best-effort current supercap pack voltage from the latest telemetry.
+
+    Prefers vpack/vcap; falls back to summing per-cell voltages (C1..C3).
+    """
+    raw = last_status.get("vpack", last_status.get("vcap"))
+    try:
+        if raw is not None:
+            return float(raw)
+    except Exception:
+        pass
+
+    cells = []
+    for key in ("C1", "C2", "C3"):
+        val = last_status.get(key)
+        try:
+            if val is not None:
+                cells.append(float(val))
+        except Exception:
+            pass
+    return sum(cells) if cells else None
+
+
+def validate_resistance_value(r_ohms) -> tuple[bool, str]:
+    """Sanity-check a measured lead resistance (input in Ohms).
+
+    Returns (ok, reason). The plausibility band is CAL_RESISTANCE_MIN/MAX_MOHM.
+    """
+    if r_ohms is None:
+        return False, "Calibration result contained no resistance value"
+    try:
+        r_mohm = float(r_ohms) * 1000.0
+    except Exception:
+        return False, "Resistance value is not numeric"
+    if r_mohm <= 0:
+        return False, f"Implausible resistance: {r_mohm:.3f} mΩ (must be > 0)"
+    if r_mohm < CAL_RESISTANCE_MIN_MOHM or r_mohm > CAL_RESISTANCE_MAX_MOHM:
+        return False, (
+            f"Measured {r_mohm:.3f} mΩ is outside the plausible range "
+            f"({CAL_RESISTANCE_MIN_MOHM:.2f}–{CAL_RESISTANCE_MAX_MOHM:.2f} mΩ)"
+        )
+    return True, ""
+
+
+def wait_for_calibration_result(timeout: float = CAL_RESULT_TIMEOUT_S,
+                                waiter: dict | None = None) -> dict:
+    """Block until a terminal calibration result arrives or the timeout elapses.
+
+    If `waiter` is provided it is used as-is (caller is responsible for removal);
+    otherwise one is registered and removed here. Returning a pre-registered
+    waiter lets callers register BEFORE sending the command to avoid a race.
+    """
+    own = waiter is None
+    if own:
+        waiter = _register_cal_waiter()
+    try:
+        if waiter["event"].wait(timeout=timeout):
+            return waiter.get("payload") or {}
+        return {
+            "status": "timeout",
+            "error": "TIMEOUT",
+            "message": f"Calibration timed out after {timeout:.0f}s",
+        }
+    finally:
+        if own:
+            _remove_cal_waiter(waiter)
+
+
+@app.route("/api/calibrate_lead_r", methods=["POST"])
+def api_calibrate_lead_r():
+    """Trigger automatic lead-resistance calibration on the STM32.
+
+    Workflow:
+      1. Verify the ESP32 link is connected.
+      2. Check supercap voltage; warn (unless force=true) if below CAL_MIN_VOLTAGE_V.
+      3. Send CAL_LEAD_START and wait for CAL_RESULT / CAL_ERROR.
+      4. Validate the measured resistance.
+      5. Persist to settings.json and push SET_LEAD_R to the STM32 (ACK-checked).
+      6. Broadcast the update and return JSON.
+
+    Optional JSON body: {"force": true} to bypass the low-voltage gate.
+    """
+    global current_settings
+
+    data = request.get_json(silent=True) or {}
+    force = bool(data.get("force", False))
+
+    if not (esp_link and esp_link.connected and esp_connected):
+        return jsonify({
+            "status": "error",
+            "error": "NOT_CONNECTED",
+            "message": "ESP32 not connected. Cannot calibrate.",
+        }), 503
+
+    v_total = _current_pack_voltage()
+
+    # Voltage gate: warn (and stop) unless the caller explicitly forces.
+    if (v_total is not None) and (v_total < CAL_MIN_VOLTAGE_V) and not force:
+        log(f"⚠️ Calibration blocked: low voltage {v_total:.2f}V (< {CAL_MIN_VOLTAGE_V:.0f}V)")
+        return jsonify({
+            "status": "warning",
+            "error": "VOLTAGE_LOW",
+            "voltage": round(v_total, 2),
+            "min_voltage": CAL_MIN_VOLTAGE_V,
+            "can_proceed": True,
+            "message": (
+                f"Pack voltage {v_total:.2f}V is below the recommended "
+                f"{CAL_MIN_VOLTAGE_V:.0f}V. Charge up for best accuracy, "
+                f"or retry with force=true."
+            ),
+        })
+
+    # Register the waiter BEFORE sending so a fast STM32 response is never missed.
+    waiter = _register_cal_waiter()
+    log(f"🔧 Lead-R calibration requested (voltage={v_total}, force={force}) -> {CAL_LEAD_COMMAND}")
+
+    if not esp_link.send_command(CAL_LEAD_COMMAND):
+        _remove_cal_waiter(waiter)
+        return jsonify({
+            "status": "error",
+            "error": "SEND_FAILED",
+            "message": "Failed to send calibration command to ESP32.",
+        }), 500
+
+    try:
+        result = wait_for_calibration_result(timeout=CAL_RESULT_TIMEOUT_S, waiter=waiter)
+    finally:
+        _remove_cal_waiter(waiter)
+
+    if result.get("status") != "success":
+        err = result.get("error", "UNKNOWN")
+        msg = result.get("message") or f"Calibration failed ({err})"
+        log(f"❌ Calibration failed: {err}")
+        status_code = 504 if err == "TIMEOUT" else 400
+        return jsonify({
+            "status": "error",
+            "error": err,
+            "message": msg,
+        }), status_code
+
+    # Validate the measured resistance before trusting it.
+    r_ohms = result.get("resistance_ohms")
+    ok, why = validate_resistance_value(r_ohms)
+    if not ok:
+        log(f"❌ Calibration result rejected: {why} (raw_ohms={r_ohms})")
+        return jsonify({
+            "status": "error",
+            "error": "INVALID_RESULT",
+            "message": why,
+            "raw_resistance_ohms": r_ohms,
+        }), 400
+
+    r_mohm_measured = float(r_ohms) * 1000.0
+    r_mohm = _normalize_lead_resistance_mohm(r_mohm_measured)
+
+    # Persist to settings.json.
+    settings = current_settings or load_settings()
+    settings["lead_resistance_mohm"] = r_mohm
+    current_settings = settings
+    local_saved = save_settings(settings)
+
+    # Push the calibrated value to the STM32 using the existing ACK-checked command.
+    ack_result = _send_command_with_ack(
+        f"SET_LEAD_R,{r_mohm:.3f}", "LEAD_R",
+        timeout_s=SETTINGS_ACK_TIMEOUT_S, retries=SETTINGS_ACK_RETRIES,
+    )
+    hw_ok = bool(ack_result.get("ok"))
+    if not hw_ok:
+        log(f"⚠️ Calibration measured {r_mohm:.3f} mΩ but SET_LEAD_R was not ACKed: "
+            f"{ack_result.get('error')}")
+
+    log(f"✅ Calibration complete: measured={r_mohm_measured:.3f} mΩ "
+        f"stored={r_mohm:.3f} mΩ hw_ack={hw_ok}")
+
+    # Broadcast to all connected web clients.
+    socketio.emit("calibration_update", {
+        "status": "complete",
+        "lead_resistance_mohm": r_mohm,
+        "resistance_ohms": round(float(r_ohms), 6),
+        "hardware_ack": hw_ok,
+    })
+    socketio.emit("settings_updated", settings)
+    emit_status_update({"lead_resistance_mohm": r_mohm})
+
+    return jsonify({
+        "status": "success",
+        "resistance_ohms": round(float(r_ohms), 6),
+        "resistance_milliohms": round(r_mohm, 3),
+        "measured_milliohms": round(r_mohm_measured, 3),
+        "voltage": round(v_total, 2) if v_total is not None else None,
+        "hardware_ack": hw_ok,
+        "local_saved": bool(local_saved),
+        "message": f"Calibration complete: {r_mohm:.3f} mΩ",
+    })
 
 
 @socketio.on("connect")
