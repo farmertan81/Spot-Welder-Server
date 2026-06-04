@@ -951,11 +951,19 @@
                 <div class="cal-box">
                     <strong style="color:#ccc;">Before you start:</strong>
                     <ol>
-                        <li>Firmly short the weld tips together.</li>
                         <li>Ensure the supercaps are charged (8&nbsp;V+ recommended).</li>
-                        <li>Click START to run a short test pulse.</li>
-                        <li>The measured resistance is saved and synced automatically.</li>
+                        <li>Click START, then trigger the test pulse:</li>
                     </ol>
+                    <div style="margin:10px 0 2px; padding:10px 12px; background:#161616; border-radius:6px;">
+                        <div style="color:#ddd;">Short the weld tips together <strong>OR</strong> press the pedal</div>
+                        <div style="font-size:13px; color:#888; margin-top:6px; line-height:1.5;">
+                            • <strong style="color:#aaa;">Contact:</strong> 2&nbsp;second delay (for a firm grip), then fires<br>
+                            • <strong style="color:#aaa;">Pedal:</strong> fires immediately
+                        </div>
+                    </div>
+                    <div style="font-size:13px; color:#888; margin-top:8px;">
+                        The measured resistance is saved and synced automatically.
+                    </div>
                 </div>
                 <div class="cal-box">
                     <div class="cal-volt-row">
@@ -2032,12 +2040,23 @@
             }
         });
 
+        // Friendly text for each CAL_STATUS value emitted by the STM32.
+        const CAL_STATUS_TEXT = {
+            'WAITING_FOR_TRIGGER': 'Waiting for contact or pedal…',
+            'CONTACT_DETECTED': 'Contact detected — hold the tips together firmly…',
+            'WAITING_2SEC': 'Hold steady… firing test pulse in 2 seconds',
+            'PEDAL_PRESSED': 'Pedal pressed — firing test pulse…',
+            'MEASURING': 'Running test pulse and measuring…',
+            'CHARGING': 'Charging capacitors…',
+        };
+
         // Live progress messages from the backend (CAL_STATUS / completion).
         socket.on('calibration_update', (data) => {
             if (!data) return;
             const txt = document.getElementById('calProgressText');
-            if (data.status === 'progress' && data.message && txt) {
-                txt.textContent = data.message;
+            if (data.status === 'progress' && txt) {
+                const key = (data.message || '').trim().toUpperCase();
+                txt.textContent = CAL_STATUS_TEXT[key] || data.message || 'Calibrating…';
             }
         });
 
