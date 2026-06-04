@@ -509,6 +509,17 @@ def _build_settings_command_plan(settings: dict) -> list[dict]:
 
 # ========== SETTINGS / PRESETS ==========
 def load_settings() -> dict:
+    # Auto-create settings.json from template on first run
+    if not os.path.exists(SETTINGS_FILE):
+        template_file = "settings.default.json"
+        if os.path.exists(template_file):
+            try:
+                import shutil
+                shutil.copy(template_file, SETTINGS_FILE)
+                log(f"✅ Created {SETTINGS_FILE} from {template_file}")
+            except Exception as e:
+                log(f"⚠️ Failed to copy template settings: {e}")
+    
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, "r") as f:
