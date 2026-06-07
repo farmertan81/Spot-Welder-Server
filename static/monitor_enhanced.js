@@ -139,9 +139,21 @@ socket.on('weld_complete', function (data) {
         setText('jouleLoss', data.joule_loss_j, 2);
     }
 
+    // Duration display.
+    // In JOULE mode the weld runs until the energy target is reached, so its
+    // length VARIES with the target (e.g. 50J vs 30J vs 20J) and `d1` is only
+    // the safety-timeout (a fixed value) — showing it makes the field look
+    // "stuck". Use the STM32-measured weld time instead. In TIME mode the
+    // configured main-pulse duration (d1) is the correct value to show.
+    const measuredDurationMs = toConfiguredMs(
+        data.joule_duration_ms ?? data.duration_ms ?? data.total_ms
+    );
     const configuredMainDurationMs = toConfiguredMs(data.configured_main_ms ?? data.d1);
-    if (configuredMainDurationMs !== null) {
-        setText('duration', configuredMainDurationMs, 0);
+    const durationMs = isJouleMode
+        ? (measuredDurationMs ?? configuredMainDurationMs)
+        : (configuredMainDurationMs ?? measuredDurationMs);
+    if (durationMs !== null) {
+        setText('duration', durationMs, 0);
     } else {
         setText('duration', null, 0);
     }
