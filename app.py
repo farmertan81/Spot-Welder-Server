@@ -23,9 +23,32 @@ DEFAULT_ESP32_PORT = 8888
 ESP32_IP = DEFAULT_ESP32_IP
 ESP32_PORT = DEFAULT_ESP32_PORT
 
-SETTINGS_FILE = "settings.json"
-PRESETS_FILE = "presets.json"
-LOG_FILE = "welder.log"
+# ----------------------------------------------------------------------------
+# File paths are anchored to THIS script's directory (BASE_DIR), NOT the
+# current working directory. This makes the server robust no matter how it is
+# launched (systemd, `python app.py`, `cd / && python /path/app.py`, etc.).
+#
+# History / why this matters: the server tree was flattened from `rpi/server/`
+# to the repo root. `settings.json` is gitignored (runtime, user-specific), so
+# it did NOT move with the `git mv`. With CWD-relative paths the server would
+# silently start reading a brand-new settings.json at the new location and lose
+# the user's dialed-in calibration/recipe -> "all over the map". Anchoring +
+# legacy migration (see load_settings) fixes that permanently.
+# ----------------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+PRESETS_FILE = os.path.join(BASE_DIR, "presets.json")
+LOG_FILE = os.path.join(BASE_DIR, "welder.log")
+TEMPLATE_SETTINGS_FILE = os.path.join(BASE_DIR, "settings.default.json")
+
+# Legacy settings.json locations (pre-flatten) to auto-migrate from on first
+# run after the rpi/server -> root restructure. Ordered most-recent-first.
+LEGACY_SETTINGS_FILES = [
+    os.path.join(BASE_DIR, "rpi", "server", "settings.json"),
+    os.path.join(BASE_DIR, "server", "settings.json"),
+    os.path.join(os.path.dirname(BASE_DIR), "rpi", "server", "settings.json"),
+]
 
 CONNECT_TIMEOUT_S = 3.0
 RECV_TIMEOUT_S = 3.0
@@ -631,14 +654,30 @@ def _build_settings_command_plan(settings: dict) -> list[dict]:
 
 # ========== SETTINGS / PRESETS ==========
 def load_settings() -> dict:
-    # Auto-create settings.json from template on first run
+    # On first run after the rpi/server -> root restructure, recover the user's
+    # dialed-in settings by migrating a legacy settings.json before falling back
+    # to the template. This prevents silently losing calibration/recipe.
     if not os.path.exists(SETTINGS_FILE):
-        template_file = "settings.default.json"
-        if os.path.exists(template_file):
+        import shutil
+
+        migrated = False
+        for legacy in LEGACY_SETTINGS_FILES:
+            if os.path.abspath(legacy) == os.path.abspath(SETTINGS_FILE):
+                continue
+            if os.path.exists(legacy):
+                try:
+                    shutil.copy(legacy, SETTINGS_FILE)
+                    log(f"✅ Migrated legacy settings: {legacy} -> {SETTINGS_FILE}")
+                    migrated = True
+                    break
+                except Exception as e:
+                    log(f"⚠️ Failed to migrate legacy settings from {legacy}: {e}")
+
+        # No legacy file found -> seed from template (fresh install).
+        if not migrated and os.path.exists(TEMPLATE_SETTINGS_FILE):
             try:
-                import shutil
-                shutil.copy(template_file, SETTINGS_FILE)
-                log(f"✅ Created {SETTINGS_FILE} from {template_file}")
+                shutil.copy(TEMPLATE_SETTINGS_FILE, SETTINGS_FILE)
+                log(f"✅ Created {SETTINGS_FILE} from {TEMPLATE_SETTINGS_FILE}")
             except Exception as e:
                 log(f"⚠️ Failed to copy template settings: {e}")
     

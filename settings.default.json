@@ -1,10 +1,13 @@
 {
+  "active_preset": null,
   "contact_hold_steps": 4,
+  "control_mode": 0,
   "d1": 10,
   "d2": 2,
   "d3": 4,
   "gap1": 1,
   "gap2": 3,
+  "joule_target_j": 50,
   "lead_resistance_mohm": 1.5,
   "mode": 2,
   "power": 80,
