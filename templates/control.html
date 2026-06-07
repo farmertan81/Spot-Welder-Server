@@ -1048,6 +1048,52 @@
         let currentPreset = null;
         let saveInProgress = false; // Blocks full STATUS field apply while save transaction is active
 
+        // ============================================================
+        // DRAFT / DIRTY STATE MODEL
+        // ------------------------------------------------------------
+        // User input is SACRED. The moment the user touches a control we mark
+        // its logical GROUP dirty. While a group is dirty, incoming STATUS
+        // packets are NOT allowed to overwrite that group's fields — this is
+        // what stops settings from "reverting immediately" while editing.
+        //
+        // On a successful Save (hardware ACK confirmed), we clear ALL dirty
+        // groups so STATUS sync resumes and the UI re-syncs to the STM32's
+        // authoritative values. The user can edit again immediately.
+        //
+        // Groups: 'pulse' (mode + d1/gap1/d2/gap2/d3), 'joule'
+        // (control_mode + joule target), 'power', 'preheat', 'lead_r'.
+        const dirtyGroups = new Set();
+
+        // Maps each editable control id -> the dirty group it belongs to.
+        const fieldGroupMap = {
+            mode: 'pulse',
+            d1: 'pulse', gap1: 'pulse', d2: 'pulse', gap2: 'pulse', d3: 'pulse',
+            jouleTargetSlider: 'joule',
+            powerInput: 'power', powerSlider: 'power',
+            preheatEnable: 'preheat',
+            preheatDuration: 'preheat', preheatDurationSlider: 'preheat',
+            preheatPower: 'preheat', preheatPowerSlider: 'preheat',
+            preheatGap: 'preheat', preheatGapSlider: 'preheat',
+            leadResistance: 'lead_r'
+        };
+
+        function markGroupDirty(group) {
+            if (!group) return;
+            dirtyGroups.add(group);
+        }
+
+        function markFieldDirty(fieldId) {
+            markGroupDirty(fieldGroupMap[fieldId]);
+        }
+
+        function isGroupDirty(group) {
+            return dirtyGroups.has(group);
+        }
+
+        function clearAllDirty() {
+            dirtyGroups.clear();
+        }
+
         const PULSE_FIELD_STATUS_GUARD_MS = 2000;
         let pulseFieldGuardUntilMs = 0;
 
@@ -1385,18 +1431,31 @@
             if (!data || typeof data !== 'object') return;
             if (saveInProgress) return; // Block broad field sync while an explicit save request is in flight.
 
+            // DIRTY-GROUP GATING (primary protection): if the user has touched a
+            // group and not yet applied, STATUS must NOT overwrite those fields.
+            // The legacy focus/drag/time guards are kept as a secondary safety
+            // net for the brief window around an in-flight save.
+            const pulseDirty = isGroupDirty('pulse');
+            const jouleDirty = isGroupDirty('joule');
+            const powerDirty = isGroupDirty('power');
+            const preheatDirty = isGroupDirty('preheat');
+            const leadDirty = isGroupDirty('lead_r');
+
             const pulseGuardActive = isPulseFieldStatusGuardActive();
 
             const mode = Number(data.mode);
-            if (!pulseGuardActive && Number.isFinite(mode) && mode >= 1 && mode <= 3) {
+            if (!pulseDirty && !pulseGuardActive && Number.isFinite(mode) && mode >= 1 && mode <= 3) {
                 const modeEl = document.getElementById('mode');
                 if (modeEl && document.activeElement !== modeEl) {
                     modeEl.value = String(mode);
-                    modeEl.dispatchEvent(new Event('change'));
+                    // Call the handler directly instead of dispatching a 'change'
+                    // event, so this programmatic STATUS sync does NOT mark the
+                    // pulse group dirty (which would block future syncs).
+                    if (typeof onModeChanged === 'function') onModeChanged();
                 }
             }
 
-            if (!pulseGuardActive) {
+            if (!pulseDirty && !pulseGuardActive) {
                 const pulseKeys = ['d1', 'gap1', 'd2', 'gap2', 'd3'];
                 pulseKeys.forEach((key) => {
                     const v = Number(data[key]);
@@ -1407,57 +1466,66 @@
                 });
             }
 
-            const controlModeRaw = data.control_mode ?? data.controlMode ?? data.ctrl_mode;
-            const controlMode = Number(controlModeRaw);
-            if (Number.isFinite(controlMode)) {
-                setControlMode(controlMode, false);
-            }
+            // control_mode + joule target share the 'joule' group.
+            if (!jouleDirty) {
+                const controlModeRaw = data.control_mode ?? data.controlMode ?? data.ctrl_mode;
+                const controlMode = Number(controlModeRaw);
+                if (Number.isFinite(controlMode)) {
+                    setControlMode(controlMode, false);
+                }
 
-            const jouleTargetRaw = data.joule_target_j ?? data.joule_target ?? data.jtarget_j;
-            const jouleTarget = Number(jouleTargetRaw);
-            if (Number.isFinite(jouleTarget) && !sliderDragState.isDragging('jouleTargetSlider')) {
-                const clamped = Math.max(0, Math.min(300, Math.round(jouleTarget)));
-                const targetSlider = document.getElementById('jouleTargetSlider');
-                if (targetSlider) targetSlider.value = String(clamped);
-                updateJouleTargetDisplay(clamped);
-            }
-
-            const power = Number(data.power_pct ?? data.power);
-            if (Number.isFinite(power)) {
-                const pIn = document.getElementById('powerInput');
-                const pSl = document.getElementById('powerSlider');
-                const pVal = document.getElementById('powerValue');
-                if (!sliderDragState.isDragging('powerSlider')) {
-                    if (pIn) pIn.value = String(Math.round(power));
-                    if (pSl) pSl.value = String(Math.round(power));
-                    if (pVal) pVal.textContent = `${Math.round(power)}%`;
+                const jouleTargetRaw = data.joule_target_j ?? data.joule_target ?? data.jtarget_j;
+                const jouleTarget = Number(jouleTargetRaw);
+                if (Number.isFinite(jouleTarget) && !sliderDragState.isDragging('jouleTargetSlider')) {
+                    const clamped = Math.max(0, Math.min(300, Math.round(jouleTarget)));
+                    const targetSlider = document.getElementById('jouleTargetSlider');
+                    if (targetSlider) targetSlider.value = String(clamped);
+                    updateJouleTargetDisplay(clamped);
                 }
             }
 
-            const preheatEn = Number(data.preheat_en);
-            if (Number.isFinite(preheatEn)) {
-                updatePreheatEnable(preheatEn);
+            if (!powerDirty) {
+                const power = Number(data.power_pct ?? data.power);
+                if (Number.isFinite(power)) {
+                    const pIn = document.getElementById('powerInput');
+                    const pSl = document.getElementById('powerSlider');
+                    const pVal = document.getElementById('powerValue');
+                    if (!sliderDragState.isDragging('powerSlider')) {
+                        if (pIn) pIn.value = String(Math.round(power));
+                        if (pSl) pSl.value = String(Math.round(power));
+                        if (pVal) pVal.textContent = `${Math.round(power)}%`;
+                    }
+                }
             }
 
-            const mapPreheat = [
-                ['preheat_ms', 'preheatDuration', 'preheatDurationSlider', 'preheatDurationValue', ' ms'],
-                ['preheat_pct', 'preheatPower', 'preheatPowerSlider', 'preheatPowerValue', '%'],
-                ['preheat_gap_ms', 'preheatGap', 'preheatGapSlider', 'preheatGapValue', ' ms']
-            ];
-            mapPreheat.forEach(([src, inputId, sliderId, valueId, suffix]) => {
-                const v = Number(data[src]);
-                if (!Number.isFinite(v)) return;
-                if (sliderDragState.isDragging(sliderId)) return;
+            if (!preheatDirty) {
+                const preheatEn = Number(data.preheat_en);
+                if (Number.isFinite(preheatEn)) {
+                    updatePreheatEnable(preheatEn);
+                }
 
-                const rounded = Math.round(v);
-                const inputEl = document.getElementById(inputId);
-                const sliderEl = document.getElementById(sliderId);
-                const valueEl = document.getElementById(valueId);
-                if (inputEl) inputEl.value = String(rounded);
-                if (sliderEl) sliderEl.value = String(rounded);
-                if (valueEl) valueEl.textContent = `${rounded}${suffix}`;
-            });
+                const mapPreheat = [
+                    ['preheat_ms', 'preheatDuration', 'preheatDurationSlider', 'preheatDurationValue', ' ms'],
+                    ['preheat_pct', 'preheatPower', 'preheatPowerSlider', 'preheatPowerValue', '%'],
+                    ['preheat_gap_ms', 'preheatGap', 'preheatGapSlider', 'preheatGapValue', ' ms']
+                ];
+                mapPreheat.forEach(([src, inputId, sliderId, valueId, suffix]) => {
+                    const v = Number(data[src]);
+                    if (!Number.isFinite(v)) return;
+                    if (sliderDragState.isDragging(sliderId)) return;
 
+                    const rounded = Math.round(v);
+                    const inputEl = document.getElementById(inputId);
+                    const sliderEl = document.getElementById(sliderId);
+                    const valueEl = document.getElementById(valueId);
+                    if (inputEl) inputEl.value = String(rounded);
+                    if (sliderEl) sliderEl.value = String(rounded);
+                    if (valueEl) valueEl.textContent = `${rounded}${suffix}`;
+                });
+            }
+
+            // Trigger mode + contact-hold are immediate-apply (no draft); they
+            // are safe to reflect from STATUS at any time.
             const trigMode = data.trigger_mode;
             if (trigMode !== undefined && trigMode !== null) {
                 updateTriggerMode(trigMode);
@@ -1469,7 +1537,7 @@
             }
 
             const leadMohm = extractLeadResistanceMohm(data);
-            if (!leadRUserEditedSinceLastSave && !isLeadRStatusGuardActive() && leadMohm !== null && Number.isFinite(leadMohm)) {
+            if (!leadDirty && !leadRUserEditedSinceLastSave && !isLeadRStatusGuardActive() && leadMohm !== null && Number.isFinite(leadMohm)) {
                 const leadInput = document.getElementById('leadResistance');
                 if (leadInput && document.activeElement !== leadInput) {
                     leadInput.value = leadMohm.toFixed(2);
@@ -1550,6 +1618,11 @@
 
                 document.getElementById('mode').dispatchEvent(new Event('change'));
 
+                // We just loaded authoritative values from the server into every
+                // field, so discard any dirty flags raised by the programmatic
+                // change events above before re-syncing live STATUS.
+                clearAllDirty();
+
                 const st = await fetch('/api/status').then(r => r.json());
                 if (st && typeof st === 'object') {
                     applyStatusSettings(st.data || st);
@@ -1615,6 +1688,11 @@
 
                 if ((body?.status === 'ok' && resp.ok) || resp.ok) {
                     clearLeadRUserEdited();
+                    // Save confirmed (server applied + ACKed all commands and
+                    // persisted settings.json). Clear all draft/dirty flags so
+                    // STATUS sync resumes and the UI re-syncs to the STM32's
+                    // authoritative values. The user can edit again immediately.
+                    clearAllDirty();
                     if (!silent) {
                         setSaveStatus('Settings saved ✓', '#4CAF50');
                         setTimeout(() => setSaveStatus(''), 1200);
@@ -1915,13 +1993,21 @@
 
             const modeEl = document.getElementById('mode');
             if (modeEl) {
-                modeEl.addEventListener('change', onModeChanged);
-                modeEl.dispatchEvent(new Event('change'));
+                modeEl.addEventListener('change', () => {
+                    // Pulse mode select belongs to the 'pulse' group.
+                    markGroupDirty('pulse');
+                    onModeChanged();
+                });
+                // Initial sync should NOT mark dirty, so call handler directly.
+                onModeChanged();
             }
 
             const controlModeRadios = document.querySelectorAll('input[name="controlMode"]');
             controlModeRadios.forEach((radio) => {
                 radio.addEventListener('change', () => {
+                    // control_mode is gated by the 'joule' group in
+                    // applyStatusSettings(), so mark it dirty on change.
+                    markGroupDirty('joule');
                     setControlMode(radio.value, true);
                 });
             });
@@ -1972,6 +2058,9 @@
                 if (!el) return;
 
                 el.addEventListener('input', () => {
+                    // Mark this field's group dirty so STATUS polling stops
+                    // overwriting the user's in-progress edit until they Save.
+                    markFieldDirty(id);
                     currentPreset = null;
                     document.querySelectorAll('.preset-btn').forEach(btn => btn.classList.remove('active'));
                 });
