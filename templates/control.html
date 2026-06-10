@@ -132,6 +132,66 @@
             color: #9C27B0;
         }
 
+        /* Last-weld card values (compact 2x2 grid) */
+        .card-value.lw {
+            font-size: 1.4em;
+            color: #4CAF50;
+        }
+
+        .card-value.lw.peak {
+            color: #ff6b35;
+        }
+
+        .card-value.lw.duration {
+            color: #FF9800;
+        }
+
+        .card-value.lw.energy {
+            color: #2196F3;
+        }
+
+        /* Key/value info rows (WiFi + System panels) */
+        .info-rows {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            padding: 6px 10px;
+            background: #333;
+            border-radius: 6px;
+        }
+
+        .info-key {
+            color: #aaa;
+            font-size: 0.92em;
+        }
+
+        .info-val {
+            color: #fff;
+            font-weight: 600;
+            font-variant-numeric: tabular-nums;
+            text-align: right;
+            word-break: break-all;
+        }
+
+        .info-val.ok {
+            color: #4CAF50;
+        }
+
+        .info-val.bad {
+            color: #f44336;
+        }
+
+        .info-val.setup {
+            color: #FF9800;
+        }
+
         .video-container {
             background: #000;
             border-radius: 8px;
@@ -757,6 +817,86 @@
                         Automatically measures lead resistance for accurate Joule-mode compensation.
                     </div>
                 </div>
+
+                <!-- Last Weld Panel -->
+                <div class="panel" style="margin-top: 16px;">
+                    <h2>Last Weld</h2>
+                    <div class="status-grid" style="grid-template-columns: repeat(2, 1fr);">
+                        <div class="status-card">
+                            <div class="card-title">Duration</div>
+                            <div class="card-value lw duration"><span id="lwDuration">--</span> ms</div>
+                        </div>
+                        <div class="status-card">
+                            <div class="card-title">Peak Current</div>
+                            <div class="card-value lw peak"><span id="lwPeak">--</span> A</div>
+                        </div>
+                        <div class="status-card">
+                            <div class="card-title">Avg Current</div>
+                            <div class="card-value lw avg"><span id="lwAvg">--</span> A</div>
+                        </div>
+                        <div class="status-card">
+                            <div class="card-title">Joules</div>
+                            <div class="card-value lw energy"><span id="lwJoules">--</span> J</div>
+                        </div>
+                    </div>
+                    <div class="inline-note" style="margin-top: 8px;">
+                        Last Weld: <span id="lwTime">--:--:--</span>
+                    </div>
+                </div>
+
+                <!-- WiFi Status Panel -->
+                <div class="panel" style="margin-top: 16px;">
+                    <h2>WiFi Status</h2>
+                    <div class="info-rows">
+                        <div class="info-row">
+                            <span class="info-key">Status</span>
+                            <span class="info-val" id="wifiStatus">--</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-key">Network (SSID)</span>
+                            <span class="info-val" id="wifiSsid">--</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-key">IP Address</span>
+                            <span class="info-val" id="wifiIp">--</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-key">Signal (RSSI)</span>
+                            <span class="info-val" id="wifiRssi">--</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- System Info Panel -->
+                <div class="panel" style="margin-top: 16px;">
+                    <h2>System Info</h2>
+                    <div class="info-rows">
+                        <div class="info-row">
+                            <span class="info-key">Firmware</span>
+                            <span class="info-val" id="sysFw">--</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-key">ESP32 Chip</span>
+                            <span class="info-val" id="sysChip">--</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-key">Uptime</span>
+                            <span class="info-val" id="sysUptime">--</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-key">Total Welds</span>
+                            <span class="info-val" id="sysWelds">--</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-key">Flash</span>
+                            <span class="info-val" id="sysFlash">--</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-key">Free Heap</span>
+                            <span class="info-val" id="sysHeap">--</span>
+                        </div>
+                    </div>
+                </div>
             </div>
 
             <div>
@@ -927,7 +1067,7 @@
                         <label>Lead Resistance (mΩ)</label>
                         <input type="number" id="leadResistance" value="1.87" min="0.10" max="10.00" step="0.01">
                         <div class="inline-note">Range: 0.10–10.00 mΩ</div>
-                        <div class="inline-note" id="leadResistanceLive">Current STM32: -- mΩ</div>
+                        <div class="inline-note" id="leadResistanceLive">Current STM32: --</div>
                     </div>
 
                     <div style="display:flex; align-items:center; gap:10px; margin-top:8px;">
@@ -992,11 +1132,11 @@
                 <h2 class="ok">✓ Calibration Complete</h2>
                 <div class="cal-box">
                     <div class="label" style="text-align:center; color:#888; font-size:0.85em;">New Lead Resistance</div>
-                    <div id="calResultValue" class="cal-result-value">-- mΩ</div>
+                    <div id="calResultValue" class="cal-result-value">--</div>
                     <div class="cal-compare">
                         <div style="text-align:center;">
                             <div class="label">Previous</div>
-                            <div id="calOldValue" class="val">-- mΩ</div>
+                            <div id="calOldValue" class="val">--</div>
                         </div>
                         <div style="text-align:center;">
                             <div class="label">Change</div>
@@ -1143,6 +1283,131 @@
             }
 
             return null;
+        }
+
+        // Lead-resistance display format matches the ESP32 Setup tab: "2.1m"
+        // (value is milliohms, one decimal, suffixed with "m").
+        // e.g. 2.055 mΩ -> "2.1m", 3.42 mΩ -> "3.4m".
+        function formatLeadR(mohm) {
+            if (mohm === null || mohm === undefined || !Number.isFinite(Number(mohm))) {
+                return '--';
+            }
+            return Number(mohm).toFixed(1) + 'm';
+        }
+
+        // ---- Last Weld panel (driven by weld_complete) ----
+        function setLastWeldText(id, val, decimals) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            const n = Number(val);
+            el.textContent = (val !== undefined && val !== null && Number.isFinite(n))
+                ? n.toFixed(decimals)
+                : '--';
+        }
+
+        function updateLastWeld(data) {
+            if (!data || typeof data !== 'object') return;
+
+            const parsedMode = Number(data.mode ?? data.control_mode);
+            const isJouleMode = Number.isFinite(parsedMode) && parsedMode === 1;
+
+            const legacyEnergyJ = data.energy_weld_j !== undefined
+                ? data.energy_weld_j
+                : (data.energy_joules !== undefined ? data.energy_joules : data.energy_j);
+            // In Joule mode prefer the workpiece energy the control loop regulates.
+            const energyJ = (isJouleMode && data.joule_workpiece_j !== undefined && data.joule_workpiece_j !== null)
+                ? data.joule_workpiece_j
+                : legacyEnergyJ;
+
+            // Duration: prefer the STM32-measured weld time; in time mode fall
+            // back to the configured main-pulse (d1) if no measurement present.
+            const measuredMs = data.duration_ms ?? data.total_ms ?? data.joule_duration_ms;
+            const configuredMs = data.configured_main_ms ?? data.d1;
+            const durationMs = isJouleMode
+                ? (measuredMs ?? configuredMs)
+                : (configuredMs ?? measuredMs);
+
+            setLastWeldText('lwDuration', durationMs, 0);
+            setLastWeldText('lwPeak', data.peak_current_amps, 0);
+            setLastWeldText('lwAvg', data.avg_current_amps, 0);
+            setLastWeldText('lwJoules', energyJ, 1);
+
+            const timeEl = document.getElementById('lwTime');
+            if (timeEl) timeEl.textContent = new Date().toLocaleTimeString();
+        }
+
+        // ---- WiFi + System panels (driven by status_update) ----
+        function formatUptime(sec) {
+            const s = Math.max(0, Math.floor(Number(sec) || 0));
+            const d = Math.floor(s / 86400);
+            const h = Math.floor((s % 86400) / 3600);
+            const m = Math.floor((s % 3600) / 60);
+            const ss = s % 60;
+            if (d > 0) return `${d}d ${h}h ${m}m`;
+            if (h > 0) return `${h}h ${m}m`;
+            if (m > 0) return `${m}m ${ss}s`;
+            return `${ss}s`;
+        }
+
+        function formatBytes(bytes) {
+            const b = Number(bytes);
+            if (!Number.isFinite(b) || b <= 0) return '--';
+            if (b >= 1024 * 1024) return (b / (1024 * 1024)).toFixed(1) + ' MB';
+            if (b >= 1024) return (b / 1024).toFixed(0) + ' KB';
+            return b + ' B';
+        }
+
+        function setInfo(id, text) {
+            const el = document.getElementById(id);
+            if (el) el.textContent = (text === undefined || text === null || text === '') ? '--' : text;
+        }
+
+        function updateWifiPanel(data) {
+            if (!data || typeof data !== 'object') return;
+            if (data.wifi_connected === undefined && data.wifi_ssid === undefined &&
+                data.wifi_ip === undefined && data.wifi_rssi === undefined) {
+                return; // No WiFi fields in this packet — leave panel untouched.
+            }
+
+            const connected = Number(data.wifi_connected) === 1;
+            const apMode = Number(data.wifi_ap_mode) === 1;
+
+            const statusEl = document.getElementById('wifiStatus');
+            if (statusEl) {
+                if (apMode) {
+                    statusEl.textContent = 'Setup AP';
+                    statusEl.className = 'info-val setup';
+                } else if (connected) {
+                    statusEl.textContent = 'Connected';
+                    statusEl.className = 'info-val ok';
+                } else {
+                    statusEl.textContent = 'Disconnected';
+                    statusEl.className = 'info-val bad';
+                }
+            }
+
+            setInfo('wifiSsid', data.wifi_ssid);
+            setInfo('wifiIp', data.wifi_ip);
+
+            // RSSI only meaningful in station (non-AP) mode.
+            const rssi = Number(data.wifi_rssi);
+            if (apMode) {
+                setInfo('wifiRssi', 'n/a (AP)');
+            } else if (Number.isFinite(rssi) && rssi !== 0) {
+                setInfo('wifiRssi', `${rssi} dBm`);
+            } else {
+                setInfo('wifiRssi', '--');
+            }
+        }
+
+        function updateSystemPanel(data) {
+            if (!data || typeof data !== 'object') return;
+            if (data.fw_version !== undefined) setInfo('sysFw', data.fw_version);
+            if (data.chip_model !== undefined) setInfo('sysChip', data.chip_model);
+            if (data.uptime_s !== undefined) setInfo('sysUptime', formatUptime(data.uptime_s));
+            if (typeof data.weld_count === 'number') setInfo('sysWelds', data.weld_count);
+            if (data.flash_size !== undefined) setInfo('sysFlash', formatBytes(data.flash_size));
+            if (data.free_heap !== undefined) setInfo('sysHeap', formatBytes(data.free_heap));
         }
 
         class SettingsManager {
@@ -1921,11 +2186,20 @@
             const leadMohm = extractLeadResistanceMohm(data);
             if (leadMohm !== null && Number.isFinite(leadMohm)) {
                 const liveEl = document.getElementById('leadResistanceLive');
-                if (liveEl) liveEl.textContent = `Current STM32: ${leadMohm.toFixed(3)} mΩ`;
+                if (liveEl) liveEl.textContent = `Current STM32: ${formatLeadR(leadMohm)}`;
             }
 
             updateChargerCurrent(data);
 
+            // New ESP32 telemetry: WiFi + System info panels.
+            updateWifiPanel(data);
+            updateSystemPanel(data);
+
+        });
+
+        // Last Weld panel — populated from the STM32 WELD_DONE event.
+        socket.on('weld_complete', (data) => {
+            updateLastWeld(data);
         });
 
         // Smoothed voltage labels from ESP32 DISPLAY stream (1Hz, 5mV threshold).
@@ -2200,14 +2474,14 @@
             if (result && result.status === 'success') {
                 const newValue = Number(result.resistance_milliohms);
 
-                document.getElementById('calResultValue').textContent = newValue.toFixed(3) + ' mΩ';
+                document.getElementById('calResultValue').textContent = formatLeadR(newValue);
                 document.getElementById('calOldValue').textContent =
-                    Number.isFinite(oldValue) ? oldValue.toFixed(3) + ' mΩ' : '--';
+                    Number.isFinite(oldValue) ? formatLeadR(oldValue) : '--';
 
                 const changeEl = document.getElementById('calChangeValue');
                 if (Number.isFinite(oldValue)) {
                     const change = newValue - oldValue;
-                    changeEl.textContent = (change >= 0 ? '+' : '') + change.toFixed(3) + ' mΩ';
+                    changeEl.textContent = (change >= 0 ? '+' : '') + change.toFixed(1) + 'm';
                     changeEl.style.color = Math.abs(change) < 0.05 ? '#ccc'
                         : (change > 0 ? '#ff9a9a' : '#4CAF50');
                 } else {
@@ -2235,7 +2509,7 @@
                     }
                 }
                 const liveEl = document.getElementById('leadResistanceLive');
-                if (liveEl) liveEl.textContent = `Current STM32: ${newValue.toFixed(3)} mΩ`;
+                if (liveEl) liveEl.textContent = `Current STM32: ${formatLeadR(newValue)}`;
 
                 calShowScreen('results');
                 setCalStatus('✓ Calibrated', '#4CAF50');
