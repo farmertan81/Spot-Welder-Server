@@ -2224,8 +2224,16 @@ def api_save_settings():
         data["trigger_mode"] = "pedal"
     if "contact_hold_steps" not in data:
         data["contact_hold_steps"] = 2
+    # Lead resistance is no longer editable from this form (the manual input was
+    # removed; it is set exclusively via Auto Calibration). When the payload
+    # omits it, preserve the currently saved/calibrated value rather than
+    # resetting to the default — otherwise every Save would clobber the
+    # auto-calibrated value and push the default to the STM32.
     if "lead_resistance_mohm" not in data:
-        data["lead_resistance_mohm"] = LEAD_RESISTANCE_DEFAULT_MOHM
+        _saved = current_settings or load_settings()
+        data["lead_resistance_mohm"] = _saved.get(
+            "lead_resistance_mohm", LEAD_RESISTANCE_DEFAULT_MOHM
+        )
     if "control_mode" not in data:
         data["control_mode"] = 0
     if "joule_target_j" not in data:
