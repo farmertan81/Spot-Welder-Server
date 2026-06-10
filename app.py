@@ -2623,12 +2623,48 @@ def api_calibrate_lead_r():
 @socketio.on("connect")
 def handle_connect():
     log(f"🌐 Client connected: {request.sid}")
+    # 1) Immediately push whatever we have cached so the page is never blank.
     emit("status_update", {**last_status, "esp_connected": esp_connected})
+    # 2) Force a FRESH snapshot from the ESP32. The ESP32<->Flask TCP link stays
+    #    up across browser reloads, so without this an opened/reloaded page would
+    #    only ever see the last cached values until the next periodic STATUS.
+    _request_fresh_status_from_esp32("browser connect")
 
 
 @socketio.on("disconnect")
 def handle_disconnect():
     log(f"🌐 Client disconnected: {request.sid}")
+
+
+def _request_fresh_status_from_esp32(reason: str = "") -> bool:
+    """Ask the ESP32 to send a full STATUS snapshot right now.
+
+    The ESP32 firmware responds to a bare "STATUS" command by emitting
+    buildStatus() (control_mode, joule_target_j, wifi_*, etc.) immediately.
+    Safe no-op if the TCP link is down.
+    """
+    try:
+        if esp_link is not None and getattr(esp_link, "connected", False):
+            ok = esp_link.send_command("STATUS", log_send=False)
+            log(f"🔄 Requested fresh STATUS from ESP32 ({reason}) -> {'sent' if ok else 'failed'}")
+            return ok
+        log(f"⚠️ Cannot request STATUS ({reason}): ESP32 not connected")
+        return False
+    except Exception as e:
+        log(f"⚠️ _request_fresh_status_from_esp32 error: {e}")
+        return False
+
+
+@socketio.on("request_status")
+def handle_request_status(_data=None):
+    """Browser explicitly asks for current state (page load + periodic poll).
+
+    We both (a) replay the cached last_status to the requesting client so the UI
+    updates instantly, and (b) ask the ESP32 for a fresh snapshot so the cache
+    itself gets refreshed and re-broadcast within ~1s.
+    """
+    emit("status_update", {**last_status, "esp_connected": esp_connected})
+    _request_fresh_status_from_esp32("request_status")
 
 
 def init_esp32_connection():

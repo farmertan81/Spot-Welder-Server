@@ -1189,6 +1189,27 @@
             reconnectionAttempts: 10
         });
 
+        // ------------------------------------------------------------
+        // FRESH-STATE SYNC: never trust stale/default UI values.
+        // On every (re)connect AND on a slow periodic poll, ask the server
+        // for the current device state. The server replays its cache AND
+        // pokes the ESP32 for a fresh STATUS snapshot, so the page converges
+        // to the real device mode/target within ~1s of load or reconnect.
+        // ------------------------------------------------------------
+        function requestStatus() {
+            try { socket.emit('request_status'); } catch (e) { /* socket not ready yet */ }
+        }
+
+        socket.on('connect', () => {
+            console.log('🔌 Socket connected -> requesting fresh STATUS');
+            requestStatus();
+        });
+
+        // Safety-net poll so the UI self-heals even if a push is missed.
+        // Display-only/ungated panels update from these; dirty user edits are
+        // still protected by the dirty-group gating in applyStatusSettings().
+        setInterval(requestStatus, 2000);
+
         let presets = {};
         let currentPreset = null;
         let saveInProgress = false; // Blocks full STATUS field apply while save transaction is active
