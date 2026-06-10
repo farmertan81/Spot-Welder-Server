@@ -813,6 +813,23 @@ def settings_with_live_status(base_settings: dict) -> dict:
     if weld_count is not None:
         merged["weld_count"] = weld_count
 
+    # Control mode + Joule targets are LIVE-reflectable: the device (STM32 via
+    # ESP32 STATUS) is the source of truth. Without merging these, the initial
+    # /api/get_settings payload returned the persisted file defaults (e.g.
+    # TIME / 150 J), so the page loaded stale until a later STATUS arrived.
+    # Prefer live STATUS whenever present so the page is correct immediately.
+    control_mode = _to_int(_live_first("control_mode", "controlMode", "ctrl_mode"))
+    if control_mode is not None:
+        merged["control_mode"] = 1 if control_mode == 1 else 0
+
+    joule_target = _to_float(_live_first("joule_target_j", "joule_target", "jtarget_j"))
+    if joule_target is not None:
+        merged["joule_target_j"] = joule_target
+
+    joule_max = _to_int(_live_first("joule_max_ms", "joule_max"))
+    if joule_max is not None:
+        merged["joule_max_ms"] = joule_max
+
     for out_key, aliases in (
         ("C1", ("C1", "cell1", "cell_1", "c1")),
         ("C2", ("C2", "cell2", "cell_2", "c2")),
@@ -2663,6 +2680,11 @@ def handle_request_status(_data=None):
     updates instantly, and (b) ask the ESP32 for a fresh snapshot so the cache
     itself gets refreshed and re-broadcast within ~1s.
     """
+    log("=== STATUS REQUESTED (browser) ==="
+        f" mode={last_status.get('control_mode')}"
+        f" joule_target_j={last_status.get('joule_target_j')}"
+        f" wifi_ssid={last_status.get('wifi_ssid')}"
+        f" esp_connected={esp_connected}")
     emit("status_update", {**last_status, "esp_connected": esp_connected})
     _request_fresh_status_from_esp32("request_status")
 

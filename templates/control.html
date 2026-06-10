@@ -1197,13 +1197,30 @@
         // to the real device mode/target within ~1s of load or reconnect.
         // ------------------------------------------------------------
         function requestStatus() {
-            try { socket.emit('request_status'); } catch (e) { /* socket not ready yet */ }
+            try {
+                if (socket && socket.connected) {
+                    socket.emit('request_status');
+                    return true;
+                }
+            } catch (e) { /* socket not ready yet */ }
+            return false;
+        }
+
+        // Fire several rapid STATUS requests right after (re)connect so the page
+        // converges instantly even if the very first emit races the handshake or
+        // the ESP32's reply is briefly delayed.
+        function burstRequestStatus() {
+            [0, 200, 500, 1000, 1500].forEach(ms => setTimeout(requestStatus, ms));
         }
 
         socket.on('connect', () => {
-            console.log('🔌 Socket connected -> requesting fresh STATUS');
-            requestStatus();
+            console.log('🔌 Socket connected -> requesting fresh STATUS (burst)');
+            burstRequestStatus();
         });
+
+        // Belt-and-suspenders: also burst once the DOM is ready, in case the
+        // socket connected before this script attached its listeners.
+        document.addEventListener('DOMContentLoaded', burstRequestStatus);
 
         // Safety-net poll so the UI self-heals even if a push is missed.
         // Display-only/ungated panels update from these; dirty user edits are
@@ -2203,7 +2220,17 @@
         // Voltage label smoothing now happens on ESP32 via DISPLAY packet (1Hz, 5mV).
 
         socket.on('status_update', (data) => {
-            console.log('📊 Status Update:', data);
+            // ---- Focused sync diagnostics (Part 5) ----
+            // Lets you verify in the browser console (F12) that STATUS arrives
+            // on PAGE LOAD (not just after clicking a control), and that the
+            // live mode / target / WiFi fields are present.
+            console.log('=== STATUS RECEIVED ===',
+                '\n  time:', new Date().toLocaleTimeString(),
+                '\n  control_mode:', data && data.control_mode,
+                '\n  joule_target_j:', data && data.joule_target_j,
+                '\n  wifi_ssid:', data && data.wifi_ssid,
+                '\n  esp_connected:', data && data.esp_connected);
+            console.log('📊 Status Update (full):', data);
             console.log('STATUS received, active drags:', Array.from(sliderDragState.activeDrags));
 
             // Keep status_update as RAW telemetry path for fast graph/calculation consumers.
