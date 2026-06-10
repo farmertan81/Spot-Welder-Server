@@ -902,10 +902,15 @@
             <div>
                 <!-- Control Mode Panel -->
                 <div class="panel" style="margin-bottom: 16px;">
-                    <h3>CONTROL MODE</h3>
+                    <h3>CONTROL MODE
+                        <span id="controlModeLive" class="info-val" style="float:right; font-weight:600;">--</span>
+                    </h3>
                     <div class="radio-group">
                         <label><input type="radio" name="controlMode" value="0" checked> Time Mode</label>
                         <label><input type="radio" name="controlMode" value="1"> Joule Mode</label>
+                    </div>
+                    <div style="font-size:11px; opacity:0.6; margin-top:6px;">
+                        Badge shows the live mode reported by the device (always updates).
                     </div>
                 </div>
 
@@ -1360,6 +1365,28 @@
         function setInfo(id, text) {
             const el = document.getElementById(id);
             if (el) el.textContent = (text === undefined || text === null || text === '') ? '--' : text;
+        }
+
+        // Always-on (ungated) live control-mode badge. Unlike the editable
+        // radios — which are intentionally NOT synced while the user has
+        // unsaved Joule edits (jouleDirty) — this badge always reflects the
+        // mode the device reports in STATUS, so TIME/JOULE is always visible.
+        function updateControlModeLive(data) {
+            if (!data || typeof data !== 'object') return;
+            const raw = data.control_mode ?? data.controlMode ?? data.ctrl_mode;
+            const mode = Number(raw);
+            const el = document.getElementById('controlModeLive');
+            if (!el || !Number.isFinite(mode)) return; // no field → leave as-is
+
+            if (mode === 1) {
+                const tgtRaw = data.joule_target_j ?? data.joule_target ?? data.jtarget_j;
+                const tgt = Number(tgtRaw);
+                el.textContent = Number.isFinite(tgt) ? `JOULE · ${Math.round(tgt)} J` : 'JOULE';
+                el.style.color = '#ffb74d';
+            } else {
+                el.textContent = 'TIME';
+                el.style.color = '#4fc3f7';
+            }
         }
 
         function updateWifiPanel(data) {
@@ -2191,7 +2218,9 @@
 
             updateChargerCurrent(data);
 
-            // New ESP32 telemetry: WiFi + System info panels.
+            // New ESP32 telemetry: live mode badge + WiFi + System info panels.
+            // These are display-only and ungated (never blocked by dirty edits).
+            updateControlModeLive(data);
             updateWifiPanel(data);
             updateSystemPanel(data);
 
