@@ -1639,7 +1639,17 @@
         // preheat sender is used here to avoid dead/stub call paths.
 
         function onModeChanged(e) {
-            const mode = parseInt(e.target.value, 10);
+            // ROOT-CAUSE FIX: this handler is called THREE ways — from a real
+            // 'change' event (e present), and twice with NO argument (the change
+            // listener and applyStatusSettings' programmatic sync). Reading
+            // e.target.value unconditionally threw a TypeError on the no-arg
+            // calls, which aborted applyStatusSettings() (and the whole
+            // status_update handler) BEFORE control_mode / joule / WiFi were
+            // applied — so the page only refreshed after the user touched the
+            // pulse dropdown (which marked 'pulse' dirty and made
+            // applyStatusSettings skip this call). Fall back to the element.
+            const modeEl = (e && e.target) ? e.target : document.getElementById('mode');
+            const mode = parseInt(modeEl ? modeEl.value : '1', 10) || 1;
 
             document.getElementById('pulse2').classList.toggle('hidden', mode < 2);
             document.getElementById('pulse3').classList.toggle('hidden', mode < 3);
