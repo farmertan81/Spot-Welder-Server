@@ -2208,7 +2208,12 @@
                     : null;
 
             if (t !== null) {
-                document.getElementById('temp').textContent = t.toFixed(1) + ' °C';
+                // Check for sensor fault (STM32 sends -99 when thermistor disconnected)
+                if (t < -50.0) {
+                    document.getElementById('temp').textContent = 'ERR';
+                } else {
+                    document.getElementById('temp').textContent = t.toFixed(1) + ' °C';
+                }
             }
 
             if (typeof data.weld_count === 'number') {
