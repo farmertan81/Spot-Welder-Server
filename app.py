@@ -645,7 +645,7 @@ def _build_settings_command_plan(settings: dict) -> list[dict]:
         },
         {
             "name": "lead_r",
-            "cmd": f"SET_LEAD_R,{lead_r_mohm:.3f}",
+            "cmd": f"SET_LEAD_R_MOHM,{lead_r_mohm:.3f}",
             "ack": "LEAD_R",
             "fields": ["lead_resistance_mohm"],
         },
@@ -2612,7 +2612,7 @@ def api_calibrate_lead_r():
 
     # Push the calibrated value to the STM32 using the existing ACK-checked command.
     ack_result = _send_command_with_ack(
-        f"SET_LEAD_R,{r_mohm:.3f}", "LEAD_R",
+        f"SET_LEAD_R_MOHM,{r_mohm:.3f}", "LEAD_R",
         timeout_s=SETTINGS_ACK_TIMEOUT_S, retries=SETTINGS_ACK_RETRIES,
     )
     hw_ok = bool(ack_result.get("ok"))
