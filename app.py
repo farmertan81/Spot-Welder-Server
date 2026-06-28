@@ -14,7 +14,7 @@ import urllib.request
 import urllib.error
 from collections import defaultdict, deque
 from datetime import datetime
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, redirect
 from flask_socketio import SocketIO, emit
 
 # ========== CONFIGURATION ==========
@@ -2188,7 +2188,12 @@ class ESP32Link:
 # ==== WEB ROUTES ====
 @app.route("/")
 def index():
-    return render_template("control.html")
+    return redirect("/status")
+
+
+@app.route("/status")
+def status():
+    return render_template("status.html")
 
 
 @app.route("/control")

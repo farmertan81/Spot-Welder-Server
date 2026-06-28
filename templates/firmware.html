@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Firmware Update — Spot Welder</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -23,14 +24,45 @@
             gap: 12px;
         }
         header h1 { font-size: 1.3rem; color: #fff; }
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .connection-status {
+            padding: 8px 14px;
+            border-radius: 999px;
+            font-size: 0.9em;
+            font-weight: 700;
+            border: 1px solid #666;
+            background: #333;
+            color: #ff8080;
+        }
+        .connection-status.connected {
+            color: #4CAF50;
+            border-color: #4CAF50;
+            background: rgba(76, 175, 80, 0.12);
+        }
+        .connection-status.disconnected {
+            color: #f44336;
+            border-color: #f44336;
+            background: rgba(244, 67, 54, 0.1);
+        }
+        .nav-links {
+            display: flex;
+            gap: 12px;
+        }
         .nav-links a {
-            color: #4a9eff;
+            color: #fff;
             text-decoration: none;
-            margin-left: 16px;
+            padding: 10px 18px;
+            background: #333;
+            border-radius: 5px;
+            transition: background 0.3s;
             font-weight: 600;
         }
-        .nav-links a:hover { text-decoration: underline; }
-        .nav-links a.active { color: #fff; }
+        .nav-links a:hover { background: #ff6b35; }
+        .nav-links a.active { background: #ff6b35; }
         .wrap {
             max-width: 880px;
             margin: 0 auto;
@@ -144,10 +176,14 @@
 <body>
     <header>
         <h1>⚡ Firmware Update</h1>
-        <div class="nav-links">
-            <a href="/">Control</a>
-            <a href="/monitor">📊 Monitor</a>
-            <a href="/firmware" class="active">⚡ Firmware</a>
+        <div class="header-right">
+            <div id="connectionStatus" class="connection-status disconnected">Disconnected</div>
+            <div class="nav-links">
+                <a href="/status">📊 Status</a>
+                <a href="/control">⚙️ Control</a>
+                <a href="/monitor">📈 Monitor</a>
+                <a href="/firmware" class="active">⚡ Firmware</a>
+            </div>
         </div>
     </header>
 
@@ -202,6 +238,19 @@
     </div>
 
     <script>
+        // WebSocket connection status
+        const socket = io();
+        socket.on('connect', () => {
+            document.getElementById('connectionStatus').classList.remove('disconnected');
+            document.getElementById('connectionStatus').classList.add('connected');
+            document.getElementById('connectionStatus').textContent = '● Connected';
+        });
+        socket.on('disconnect', () => {
+            document.getElementById('connectionStatus').classList.remove('connected');
+            document.getElementById('connectionStatus').classList.add('disconnected');
+            document.getElementById('connectionStatus').textContent = '● Disconnected';
+        });
+
         function fmtSize(b) {
             if (b < 1024) return b + " B";
             if (b < 1024 * 1024) return (b / 1024).toFixed(1) + " KB";
