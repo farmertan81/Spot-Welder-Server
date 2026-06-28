@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Firmware Update — Spot Welder</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #1a1a1a;
+            color: #e0e0e0;
+            padding: 0;
+        }
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 24px;
+            background: #222;
+            border-bottom: 1px solid #333;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        header h1 { font-size: 1.3rem; color: #fff; }
+        .nav-links a {
+            color: #4a9eff;
+            text-decoration: none;
+            margin-left: 16px;
+            font-weight: 600;
+        }
+        .nav-links a:hover { text-decoration: underline; }
+        .nav-links a.active { color: #fff; }
+        .wrap {
+            max-width: 880px;
+            margin: 0 auto;
+            padding: 24px;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+        @media (max-width: 760px) { .wrap { grid-template-columns: 1fr; } }
+        .card {
+            background: #262626;
+            border: 1px solid #383838;
+            border-radius: 12px;
+            padding: 22px;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+        }
+        .card h2 { font-size: 1.1rem; margin-bottom: 6px; color: #fff; }
+        .card .sub { font-size: 0.82rem; color: #999; margin-bottom: 18px; }
+        .card.esp { border-top: 3px solid #e7352c; }
+        .card.stm { border-top: 3px solid #03a9f4; }
+
+        label { display: block; font-size: 0.8rem; color: #bbb; margin: 14px 0 6px; }
+        input[type="file"] {
+            width: 100%;
+            padding: 10px;
+            background: #1c1c1c;
+            border: 1px dashed #555;
+            border-radius: 8px;
+            color: #ccc;
+            font-size: 0.85rem;
+        }
+        select {
+            width: 100%;
+            padding: 9px 10px;
+            background: #1c1c1c;
+            border: 1px solid #555;
+            border-radius: 8px;
+            color: #e0e0e0;
+            font-size: 0.85rem;
+        }
+        .file-info { font-size: 0.78rem; color: #888; margin-top: 8px; min-height: 1em; }
+        button.flash {
+            width: 100%;
+            margin-top: 18px;
+            padding: 13px;
+            border: none;
+            border-radius: 8px;
+            font-weight: 700;
+            font-size: 0.95rem;
+            color: #fff;
+            cursor: pointer;
+            transition: filter 0.2s, opacity 0.2s;
+        }
+        .card.esp button.flash { background: #e7352c; }
+        .card.stm button.flash { background: #03a9f4; }
+        button.flash:hover:not(:disabled) { filter: brightness(1.12); }
+        button.flash:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .result {
+            margin-top: 16px;
+            padding: 12px 14px;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            display: none;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .result.ok   { background: #14331c; border: 1px solid #2e7d32; color: #a5d6a7; display: block; }
+        .result.err  { background: #3a1414; border: 1px solid #c62828; color: #ef9a9a; display: block; }
+        .result.busy { background: #2a2a14; border: 1px solid #b0a020; color: #f0e68c; display: block; }
+
+        .spinner {
+            display: inline-block;
+            width: 13px; height: 13px;
+            border: 2px solid rgba(255,255,255,0.25);
+            border-top-color: #fff;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-right: 8px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .note {
+            grid-column: 1 / -1;
+            background: #1f1f1f;
+            border: 1px solid #333;
+            border-radius: 10px;
+            padding: 16px 18px;
+            font-size: 0.8rem;
+            color: #999;
+            line-height: 1.55;
+        }
+        .note b { color: #ccc; }
+        .note code {
+            background: #2c2c2c;
+            padding: 1px 6px;
+            border-radius: 4px;
+            color: #4a9eff;
+            font-size: 0.78rem;
+        }
+        .target {
+            grid-column: 1 / -1;
+            text-align: center;
+            font-size: 0.82rem;
+            color: #888;
+        }
+        .target b { color: #4a9eff; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>⚡ Firmware Update</h1>
+        <div class="nav-links">
+            <a href="/">Control</a>
+            <a href="/monitor">📊 Monitor</a>
+            <a href="/firmware" class="active">⚡ Firmware</a>
+        </div>
+    </header>
+
+    <div class="wrap">
+        <div class="target">
+            Target device: <b id="targetHost">{{ esp32_ip }}</b> &nbsp;(HTTP port 80)
+        </div>
+
+        <!-- ESP32-P4 -->
+        <div class="card esp">
+            <h2>ESP32-P4 Firmware</h2>
+            <div class="sub">Upload <code>esp32_firmware.bin</code> &rarr; OTA flash the display controller.</div>
+
+            <label for="espFile">Firmware .bin</label>
+            <input type="file" id="espFile" accept=".bin">
+            <div class="file-info" id="espInfo"></div>
+
+            <button class="flash" id="espBtn" onclick="flash('esp32')">Flash ESP32-P4</button>
+            <div class="result" id="espResult"></div>
+        </div>
+
+        <!-- STM32 -->
+        <div class="card stm">
+            <h2>STM32G474 Firmware</h2>
+            <div class="sub">Upload <code>stm32_firmware.bin</code> &rarr; flash the weld controller via Katapult.</div>
+
+            <label for="stmFile">Firmware .bin</label>
+            <input type="file" id="stmFile" accept=".bin">
+            <div class="file-info" id="stmInfo"></div>
+
+            <label for="stmMethod">Bootloader entry method</label>
+            <select id="stmMethod">
+                <option value="auto" selected>Auto (software jump, hardware fallback)</option>
+                <option value="sw">Software jump only (2-wire)</option>
+                <option value="hw">Hardware pulse only (BOOT0 + NRST)</option>
+            </select>
+
+            <button class="flash" id="stmBtn" onclick="flash('stm32')">Flash STM32</button>
+            <div class="result" id="stmResult"></div>
+        </div>
+
+        <div class="note">
+            <b>How this works:</b> the file is uploaded to this Flask server, then forwarded to the device's
+            HTTP flash endpoint (<code>/ota</code> or <code>/stm32</code>) on <b>port 80</b>. This is a separate
+            service from the telemetry bridge on <b>port 8888</b> — so flashing here will <b>not</b> interrupt a
+            MobaXterm UART stream or the live Control/Monitor data.<br><br>
+            <b>Safety:</b> the server refuses to flash an ELF file (it must be the raw <code>.bin</code>).
+            Flashing an ELF previously bricked the STM32 because the header bytes land on the vector table.<br><br>
+            <b>Note:</b> after a successful ESP32-P4 flash, the device reboots — the Control/Monitor pages will
+            reconnect automatically once it is back up.
+        </div>
+    </div>
+
+    <script>
+        function fmtSize(b) {
+            if (b < 1024) return b + " B";
+            if (b < 1024 * 1024) return (b / 1024).toFixed(1) + " KB";
+            return (b / 1024 / 1024).toFixed(2) + " MB";
+        }
+
+        function wireInfo(inputId, infoId) {
+            const inp = document.getElementById(inputId);
+            const info = document.getElementById(infoId);
+            inp.addEventListener("change", () => {
+                if (inp.files.length) {
+                    const f = inp.files[0];
+                    info.textContent = f.name + "  (" + fmtSize(f.size) + ")";
+                } else {
+                    info.textContent = "";
+                }
+            });
+        }
+        wireInfo("espFile", "espInfo");
+        wireInfo("stmFile", "stmInfo");
+
+        async function flash(target) {
+            const isEsp = target === "esp32";
+            const fileInput = document.getElementById(isEsp ? "espFile" : "stmFile");
+            const btn = document.getElementById(isEsp ? "espBtn" : "stmBtn");
+            const result = document.getElementById(isEsp ? "espResult" : "stmResult");
+
+            if (!fileInput.files.length) {
+                result.className = "result err";
+                result.textContent = "Please choose a .bin file first.";
+                return;
+            }
+            const file = fileInput.files[0];
+
+            const fd = new FormData();
+            fd.append("firmware", file);
+            if (!isEsp) {
+                fd.append("method", document.getElementById("stmMethod").value);
+            }
+
+            const label = isEsp ? "ESP32-P4" : "STM32";
+            btn.disabled = true;
+            const origText = btn.textContent;
+            btn.textContent = "Flashing…";
+            result.className = "result busy";
+            result.innerHTML = '<span class="spinner"></span>Uploading & flashing ' + label +
+                               ' — this can take 1–3 minutes. Do not power off the device.';
+
+            try {
+                const resp = await fetch("/api/flash/" + target, { method: "POST", body: fd });
+                const data = await resp.json();
+                if (data.status === "ok") {
+                    result.className = "result ok";
+                    result.textContent = "✅ " + label + " flashed successfully.\n" +
+                        (data.filename ? ("File: " + data.filename + " (" + fmtSize(data.size) + ")\n") : "") +
+                        "Device says: " + (data.message || "OK");
+                } else {
+                    result.className = "result err";
+                    result.textContent = "❌ Flash failed.\n" + (data.message || ("HTTP " + (data.http_status || "?")));
+                }
+            } catch (e) {
+                result.className = "result err";
+                result.textContent = "❌ Request error: " + e +
+                    "\n(If you flashed the ESP32-P4, it may be rebooting — that's normal.)";
+            } finally {
+                btn.disabled = false;
+                btn.textContent = origText;
+            }
+        }
+    </script>
+</body>
+</html>

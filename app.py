@@ -9,6 +9,9 @@ import time
 import socket
 import threading
 import uuid
+import base64
+import urllib.request
+import urllib.error
 from collections import defaultdict, deque
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify
@@ -105,6 +108,21 @@ DEFAULT_PULSE_START_SAMPLE = 10
 # ========== FLASK SETUP ==========
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "spot-welder-secret-2024"
+# Allow firmware uploads up to 16 MB (ESP32 images are ~1-2 MB, STM32 ~256 KB).
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+
+# ---- Firmware-flash settings (P4 HTTP server, port 80) ----------------------
+# IMPORTANT: firmware flashing talks to the P4's HTTP server on port 80
+# (/ota for the ESP32-P4, /stm32 for the STM32G474). This is a DIFFERENT
+# service from the TCP telemetry bridge on port 8888 that the control/monitor
+# pages (and MobaXterm) use. They do not conflict — you can flash over HTTP
+# while MobaXterm streams the UART on 8888.
+OTA_HTTP_PORT  = 80                    # P4 HTTP server port
+OTA_USERNAME   = "admin"               # matches ESP32P4/main/ota.cpp OTA_USERNAME
+OTA_PASSWORD   = "spotwelder2024"      # matches ESP32P4/main/ota.cpp OTA_PASSWORD
+FLASH_TIMEOUT_S = 180                  # OTA + STM32 flash can take a while
+ELF_MAGIC = b"\x7fELF"                 # raw .bin must NOT start with this
+
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 # ========== GLOBAL STATE ==========
@@ -2182,6 +2200,122 @@ def control():
 def monitor():
     """Waveform monitoring page"""
     return render_template('monitor.html')
+
+
+# ============================================================
+#  FIRMWARE UPDATE  (upload a .bin from the browser -> flash the device)
+# ============================================================
+# These routes accept a firmware file uploaded from the browser and forward it
+# to the P4's HTTP flash endpoints:
+#   ESP32-P4 firmware -> POST http://<ip>:80/ota     (HTTP basic auth)
+#   STM32G474 firmware -> POST http://<ip>:80/stm32  (no auth; ?method=auto|sw|hw)
+#
+# This uses the P4 HTTP server (port 80), which is SEPARATE from the telemetry
+# bridge on port 8888. So flashing here never disturbs a MobaXterm stream or the
+# control/monitor live data.
+
+@app.route("/firmware")
+def firmware_page():
+    """Firmware update page."""
+    return render_template("firmware.html", esp32_ip=_flash_target_host())
+
+
+def _flash_target_host():
+    """The device IP/host to flash (same target as the telemetry bridge)."""
+    # ESP32_IP is resolved at startup from env/settings.json (see load_runtime_config).
+    return ESP32_IP or DEFAULT_ESP32_IP
+
+
+def _post_firmware(path, data, auth=False, query=""):
+    """POST raw firmware bytes to the P4 HTTP server. Returns (ok, status, body)."""
+    host = _flash_target_host()
+    url = "http://%s:%d%s%s" % (host, OTA_HTTP_PORT, path, query)
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/octet-stream")
+    req.add_header("Content-Length", str(len(data)))
+    if auth:
+        token = base64.b64encode(
+            ("%s:%s" % (OTA_USERNAME, OTA_PASSWORD)).encode()
+        ).decode()
+        req.add_header("Authorization", "Basic " + token)
+    log("📡 Flashing -> POST %s (%d bytes)" % (url, len(data)))
+    try:
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=FLASH_TIMEOUT_S) as resp:
+            body = resp.read().decode(errors="replace").strip()
+            dt = time.time() - t0
+            log("✅ Flash response HTTP %d (%.1fs): %s" % (resp.status, dt, body))
+            return (resp.status == 200, resp.status, body)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace").strip() if e.fp else ""
+        log("❌ Flash HTTP error %d: %s" % (e.code, body))
+        return (False, e.code, body or ("HTTP %d" % e.code))
+    except urllib.error.URLError as e:
+        log("❌ Flash connection error: %s" % e.reason)
+        return (False, 0, "Could not reach device at %s: %s" % (host, e.reason))
+    except socket.timeout:
+        log("❌ Flash timed out after %ds" % FLASH_TIMEOUT_S)
+        return (False, 0, "Timed out after %ds (device may still be flashing)" % FLASH_TIMEOUT_S)
+    except Exception as e:  # noqa: BLE001
+        log("❌ Flash unexpected error: %s" % e)
+        return (False, 0, str(e))
+
+
+def _read_upload(field="firmware"):
+    """Pull the uploaded file out of the request. Returns (data, filename, error)."""
+    if field not in request.files:
+        return (None, None, "No file part in the request")
+    f = request.files[field]
+    if not f or f.filename == "":
+        return (None, None, "No file selected")
+    data = f.read()
+    if not data:
+        return (None, None, "Uploaded file is empty")
+    # SAFETY: refuse ELF files. Flashing an ELF (instead of the raw .bin) is what
+    # bricked the STM32 before — the ELF header bytes land at the vector table.
+    if data[:4] == ELF_MAGIC:
+        return (None, f.filename,
+                "Refusing to flash: this is an ELF file, not a raw .bin. "
+                "Use the firmware .bin (esp32_firmware.bin / stm32_firmware.bin).")
+    return (data, f.filename, None)
+
+
+@app.route("/api/flash/esp32", methods=["POST"])
+def api_flash_esp32():
+    """Upload an ESP32-P4 firmware .bin and OTA-flash it via the P4 /ota endpoint."""
+    data, filename, err = _read_upload()
+    if err:
+        return jsonify({"status": "error", "message": err}), 400
+    ok, code, body = _post_firmware("/ota", data, auth=True)
+    return jsonify({
+        "status": "ok" if ok else "error",
+        "message": body,
+        "http_status": code,
+        "filename": filename,
+        "size": len(data),
+    }), (200 if ok else 502)
+
+
+@app.route("/api/flash/stm32", methods=["POST"])
+def api_flash_stm32():
+    """Upload an STM32 firmware .bin and flash it via the P4 /stm32 endpoint."""
+    data, filename, err = _read_upload()
+    if err:
+        return jsonify({"status": "error", "message": err}), 400
+    # ROM-entry method: auto (default) | sw | hw
+    method = (request.form.get("method") or "auto").strip().lower()
+    if method not in ("auto", "sw", "hw"):
+        method = "auto"
+    query = "" if method == "auto" else ("?method=%s" % method)
+    ok, code, body = _post_firmware("/stm32", data, auth=False, query=query)
+    return jsonify({
+        "status": "ok" if ok else "error",
+        "message": body,
+        "http_status": code,
+        "filename": filename,
+        "size": len(data),
+        "method": method,
+    }), (200 if ok else 502)
 
 
 @app.route("/api/status")
