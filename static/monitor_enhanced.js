@@ -214,3 +214,62 @@ socket.on('waveform_data', function (data) {
 
     waveformChart.update('none');
 });
+
+
+
+// ── Arm/Disarm button control ─────────────────────────────────
+let isArmed = false;
+let armClickPending = false;
+let armClickTimeout = null;
+
+function updateArmStateUI(enabled) {
+    isArmed = (enabled === 1 || enabled === '1' || enabled === true);
+
+    const button = document.getElementById('armButton');
+    if (!button) return;
+
+    if (isArmed) {
+        button.textContent = '🟢 ARMED';
+        button.style.borderColor = '#44ff44';
+        button.style.color = '#44ff44';
+        button.style.background = '#1a3a1a';
+        button.style.boxShadow = '0 4px 12px rgba(68,255,68,0.4)';
+    } else {
+        button.textContent = '🔴 DISARMED';
+        button.style.borderColor = '#ff4444';
+        button.style.color = '#ff4444';
+        button.style.background = '#2a2a2a';
+        button.style.boxShadow = '0 4px 8px rgba(0,0,0,0.5)';
+    }
+}
+
+function toggleArmUI() {
+    const targetArmed = !isArmed;
+    armClickPending = true;
+    updateArmStateUI(targetArmed);
+
+    clearTimeout(armClickTimeout);
+    armClickTimeout = setTimeout(() => {
+        armClickPending = false;
+    }, 500);
+
+    fetch(targetArmed ? '/api/arm' : '/api/disarm', { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+            if (data.status !== 'ok') {
+                armClickPending = false;
+                updateArmStateUI(!targetArmed);
+            }
+        })
+        .catch(() => {
+            armClickPending = false;
+            updateArmStateUI(!targetArmed);
+        });
+}
+
+// ── Status updates from backend ───────────────────────────────
+socket.on('status_update', function (data) {
+    if (data && 'armed' in data && !armClickPending) {
+        updateArmStateUI(data.armed);
+    }
+});

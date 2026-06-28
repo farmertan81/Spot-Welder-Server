@@ -284,8 +284,25 @@
 
 <body>
     <div class="container">
-        <header>
-            <h1>📊 Spot Welder Monitor</h1>
+        <header style="display: flex; align-items: center; gap: 16px;">
+            <h1 style="margin: 0;">📊 Spot Welder Monitor</h1>
+
+            <button id="armButton" onclick="toggleArmUI()" style="
+                font-size: 18px;
+                padding: 12px 24px;
+                border: 3px solid #ff4444;
+                border-radius: 8px;
+                background: #2a2a2a;
+                color: #ff4444;
+                cursor: pointer;
+                font-weight: bold;
+                transition: all 0.3s;
+                box-shadow: 0 4px 8px rgba(0,0,0,0.5);
+                white-space: nowrap;
+            ">
+                🔴 DISARMED
+            </button>
+
             <div class="header-right">
                 <div id="connectionStatus" class="connection-status disconnected">Disconnected</div>
                 <div class="nav-links">
