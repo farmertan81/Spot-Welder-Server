@@ -2563,6 +2563,14 @@ def api_disarm():
     return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
 
 
+@app.route("/api/reset_weld_counter", methods=["POST"])
+def api_reset_weld_counter():
+    if esp_link and esp_link.connected:
+        esp_link.send_command("RESET_WELD_COUNT")
+        return jsonify({"status": "ok"})
+    return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
+
+
 @app.route("/api/fire", methods=["POST"])
 def api_fire():
     if esp_link and esp_link.connected:

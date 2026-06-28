@@ -109,7 +109,7 @@
 
         .status-grid {
             display: grid;
-            grid-template-columns: repeat(5, minmax(0, 1fr));
+            grid-template-columns: repeat(4, minmax(0, 1fr));
             gap: 12px;
         }
 
@@ -315,7 +315,22 @@
         </header>
 
         <div class="panel">
-            <h2>Latest Weld Stats</h2>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                <h2 style="margin: 0;">Latest Weld Stats</h2>
+                <button id="resetCounterBtn" onclick="resetWeldCounter()" style="
+                    padding: 8px 16px;
+                    border: 2px solid #ff6b35;
+                    border-radius: 6px;
+                    background: #2a2a2a;
+                    color: #ff6b35;
+                    cursor: pointer;
+                    font-weight: bold;
+                    font-size: 0.9em;
+                    transition: all 0.3s;
+                ">
+                    🔄 Reset Counter
+                </button>
+            </div>
             <div class="status-grid">
                 <div class="status-card">
                     <div class="card-title">Peak Current</div>
@@ -333,10 +348,7 @@
                     <div class="card-title">Duration</div>
                     <div class="card-value duration"><span id="duration">--</span> ms</div>
                 </div>
-                <div class="status-card">
-                    <div class="card-title">Cap V Drop</div>
-                    <div class="card-value vdrop">↓ <span id="voltageDrop">--</span> V</div>
-                </div>
+
             </div>
             <div class="last-weld">Last Weld: <span id="lastWeldTime">--:--:--</span></div>
         </div>
@@ -346,18 +358,7 @@
             <div class="chart-wrapper">
                 <canvas id="waveformChart"></canvas>
             </div>
-            <div class="vcap-row">
-                <span class="vcap-label">Cap Voltage</span>
-                <span class="vcap-before" id="vcapBefore">--.-</span>
-                <span style="color:#aaa; font-size:0.85em;">V</span>
-                <span class="vcap-arrow">→</span>
-                <span class="vcap-after" id="vcapAfter">--.-</span>
-                <span style="color:#aaa; font-size:0.85em;">V</span>
-                <div class="vcap-bar-track">
-                    <div class="vcap-bar-fill" id="vcapBar"></div>
-                </div>
-                <span class="vcap-drop-badge">↓ <span id="vcapDrop">-.---</span> V</span>
-            </div>
+
         </div>
     </div>
 

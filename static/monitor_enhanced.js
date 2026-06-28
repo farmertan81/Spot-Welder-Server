@@ -273,3 +273,23 @@ socket.on('status_update', function (data) {
         updateArmStateUI(data.armed);
     }
 });
+
+
+
+// ── Weld Counter Reset ────────────────────────────────────────
+function resetWeldCounter() {
+    if (!confirm('Reset the weld counter to 0?')) return;
+    
+    fetch('/api/reset_weld_counter', { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+            if (data.status === 'ok') {
+                alert('✅ Weld counter reset!');
+            } else {
+                alert('❌ Failed to reset counter: ' + (data.message || 'Unknown error'));
+            }
+        })
+        .catch(err => {
+            alert('❌ Network error: ' + err.message);
+        });
+}
