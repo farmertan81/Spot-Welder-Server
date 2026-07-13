@@ -1,8 +1,15 @@
+> **📎 Historical analysis (2026-06-03).** This is a point-in-time reconnaissance
+> document written to scope a lead-resistance calibration feature. File paths were
+> normalized to the current repo root layout (`app.py`, `templates/`), but the
+> line numbers reference the state of `app.py` as of June 2026 and may have drifted.
+> Treat it as design/background reference, not as an up-to-date map. For the current
+> wire protocol see the firmware repo's `PROTOCOL.md`.
+
 # Flask Server Analysis — Joule Mode & Lead Resistance Calibration
 
 **Repository:** `farmertan81/Spot-Welder-Server` (branch: `Dev`)
 **Scope:** Read-only reconnaissance of the Raspberry Pi Flask control server to understand the existing Joule-mode and lead-resistance machinery, and to recommend where to build a **lead-resistance calibration** feature first (Flask vs ESP32).
-**Primary file analyzed:** `rpi/server/app.py` (2,320 lines) + `rpi/server/templates/control.html` (1,738 lines)
+**Primary file analyzed:** `app.py` (2,320 lines) + `templates/control.html` (1,738 lines)
 **Date:** 2026-06-03
 
 > **TL;DR recommendation:** Prototype the lead-calibration *workflow and math* on the **Flask server first**. The server already owns the full settings/ACK pipeline, the live telemetry stream (V & I), and a rich HTML UI — so you can build a calibration routine that fires a known pulse, reads back `WELD_DONE` telemetry, computes lead resistance, and writes it via the existing `SET_LEAD_R` command **without touching firmware**. Migrate to the ESP32 only once the algorithm is proven. See [Section 5](#5-recommendation-flask-first-vs-esp32-first).
@@ -306,8 +313,8 @@ But these are *optimizations*. The **algorithm, target pulse parameters, accepta
 ### Files that would change (Phase 1)
 | File | Change | Type |
 |---|---|---|
-| `rpi/server/app.py` | math helper + telemetry stash + `/api/calibrate_lead_r` | additive |
-| `rpi/server/templates/control.html` | Calibrate button + handler + results readout | additive |
+| `app.py` | math helper + telemetry stash + `/api/calibrate_lead_r` | additive |
+| `templates/control.html` | Calibrate button + handler + results readout | additive |
 
 ---
 
