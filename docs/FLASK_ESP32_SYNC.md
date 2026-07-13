@@ -7,7 +7,7 @@ that feeds it.
 
 ## What changed
 
-### 1. New telemetry forwarded by the ESP32 (`Spotwelder Full/src/main.cpp`)
+### 1. New telemetry forwarded by the ESP32 (`ESP32P4/main/welder_main.cpp`)
 `buildStatus()` (the periodic `STATUS,...` packet the ESP32 sends to Flask over
 TCP) now also includes the WiFi and System fields that previously only existed
 on the on-device Setup tab:
@@ -20,7 +20,7 @@ on the on-device Setup tab:
 | `wifi_ip` | current IP address |
 | `wifi_rssi` | signal strength in dBm (STA mode only) |
 | `fw_version` | firmware version (`FW_VERSION`, e.g. `1.0.0`) |
-| `chip_model` | `ESP.getChipModel()` (e.g. `ESP32-S3`) |
+| `chip_model` | ESP32 chip model reported by the bridge (e.g. `ESP32-P4`) |
 | `flash_size` | flash chip size in bytes |
 | `free_heap` | free heap in bytes |
 | `uptime_s` | seconds since boot |
@@ -83,9 +83,9 @@ is editing. Verified that all dirty-group infrastructure is unchanged.
 cd Spot-Welder-Server
 pip install -r requirements.txt
 
-# Point it at your ESP32 (defaults to 192.168.1.77:3333 if omitted)
+# Point it at your ESP32 (defaults to 192.168.1.77:8888 if omitted)
 export ESP32_IP=192.168.1.42        # your welder's IP (shown on the Setup tab)
-export ESP32_PORT=3333
+export ESP32_PORT=8888
 
 python3 app.py
 # → web UI on http://0.0.0.0:8080  (open http://<this-host>:8080/)

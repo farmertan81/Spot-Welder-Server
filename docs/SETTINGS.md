@@ -4,17 +4,15 @@
 
 This project uses a **template system** for settings files:
 
-### Template Files (in Git)
-- `settings.default.json` - Default weld settings template
-- `rpi/server/settings.default.json` - Server-specific settings template
+### Template File (in Git)
+- `settings.default.json` - Default weld/server settings template (repo root)
 
-These files are **committed to Git** and provide sensible defaults for new users.
+This file is **committed to Git** and provides sensible defaults for new users.
 
-### Runtime Files (NOT in Git)
-- `settings.json` - Your personal weld settings (auto-created from template)
-- `rpi/server/settings.json` - Your server runtime settings (auto-created)
+### Runtime File (NOT in Git)
+- `settings.json` - Your personal runtime settings (auto-created from the template)
 
-These files are **.gitignored** so your personal settings never get committed!
+This file is **.gitignored** so your personal settings never get committed!
 
 ## First Run Setup
 
@@ -43,7 +41,6 @@ If you want to change the default template (for all users):
 To reset your settings:
 ```bash
 cp settings.default.json settings.json
-cp rpi/server/settings.default.json rpi/server/settings.json
 ```
 
 Or just delete `settings.json` and restart the server (auto-recreates from template).
