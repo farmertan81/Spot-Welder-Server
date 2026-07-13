@@ -14,7 +14,7 @@ import urllib.request
 import urllib.error
 from collections import defaultdict, deque
 from datetime import datetime
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, redirect
 from flask_socketio import SocketIO, emit
 
 # ========== CONFIGURATION ==========
@@ -2188,7 +2188,12 @@ class ESP32Link:
 # ==== WEB ROUTES ====
 @app.route("/")
 def index():
-    return render_template("control.html")
+    return redirect("/status")
+
+
+@app.route("/status")
+def status():
+    return render_template("status.html")
 
 
 @app.route("/control")
@@ -2554,6 +2559,14 @@ def api_arm():
 def api_disarm():
     if esp_link and esp_link.connected:
         esp_link.send_command("ARM,0")
+        return jsonify({"status": "ok"})
+    return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
+
+
+@app.route("/api/reset_weld_counter", methods=["POST"])
+def api_reset_weld_counter():
+    if esp_link and esp_link.connected:
+        esp_link.send_command("RESET_WELD_COUNT")
         return jsonify({"status": "ok"})
     return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
 

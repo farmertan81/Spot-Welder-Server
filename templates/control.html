@@ -732,8 +732,9 @@
             <div class="header-right">
                 <div id="connectionStatus" class="connection-status disconnected">Disconnected</div>
                 <div class="nav-links">
-                    <a href="/">Control</a>
-                    <a href="/monitor">📊 Monitor</a>
+                    <a href="/status">📊 Status</a>
+                    <a href="/control">⚙️ Control</a>
+                    <a href="/monitor">📈 Monitor</a>
                     <a href="/firmware">⚡ Firmware</a>
                 </div>
             </div>
@@ -742,43 +743,6 @@
         <div class="grid">
             <div>
                 <div class="panel">
-                    <h2>Status</h2>
-                    <div class="status-grid">
-                        <div class="status-card">
-                            <div class="card-title">Pack Voltage</div>
-                            <div class="card-value voltage" id="vpack">0.00 V</div>
-                        </div>
-                        <div class="status-card">
-                            <div class="card-title">Temperature</div>
-                            <div class="card-value temp" id="temp">0.0 °C</div>
-                        </div>
-                        <div class="status-card">
-                            <div class="card-title">Weld Counter</div>
-                            <div class="card-value counter" id="counter">0</div>
-                        </div>
-                        <div class="status-card">
-                            <div class="card-title">Charger Current</div>
-                            <div class="card-value charger-idle" id="charger-current">0.00 A</div>
-                        </div>
-                    </div>
-
-                    <div class="cell-balance">
-                        <div class="cell">
-                            <div class="cell-label">Cell 1</div>
-                            <div class="cell-value" id="c1">0.00V</div>
-                        </div>
-                        <div class="cell">
-                            <div class="cell-label">Cell 2</div>
-                            <div class="cell-value" id="c2">0.00V</div>
-                        </div>
-                        <div class="cell">
-                            <div class="cell-label">Cell 3</div>
-                            <div class="cell-value" id="c3">0.00V</div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="panel" style="margin-top: 16px;">
                     <h2>Presets</h2>
                     <div class="presets">
                         <div class="preset-btn" onclick="loadPreset('P1')">
@@ -820,85 +784,6 @@
                     <div class="inline-note" id="leadResistanceLive" style="margin-top: 8px;">Current STM32: --</div>
                 </div>
 
-                <!-- Last Weld Panel -->
-                <div class="panel" style="margin-top: 16px;">
-                    <h2>Last Weld</h2>
-                    <div class="status-grid" style="grid-template-columns: repeat(2, 1fr);">
-                        <div class="status-card">
-                            <div class="card-title">Duration</div>
-                            <div class="card-value lw duration"><span id="lwDuration">--</span> ms</div>
-                        </div>
-                        <div class="status-card">
-                            <div class="card-title">Peak Current</div>
-                            <div class="card-value lw peak"><span id="lwPeak">--</span> A</div>
-                        </div>
-                        <div class="status-card">
-                            <div class="card-title">Avg Current</div>
-                            <div class="card-value lw avg"><span id="lwAvg">--</span> A</div>
-                        </div>
-                        <div class="status-card">
-                            <div class="card-title">Joules</div>
-                            <div class="card-value lw energy"><span id="lwJoules">--</span> J</div>
-                        </div>
-                    </div>
-                    <div class="inline-note" style="margin-top: 8px;">
-                        Last Weld: <span id="lwTime">--:--:--</span>
-                    </div>
-                </div>
-
-                <!-- WiFi Status Panel -->
-                <div class="panel" style="margin-top: 16px;">
-                    <h2>WiFi Status</h2>
-                    <div class="info-rows">
-                        <div class="info-row">
-                            <span class="info-key">Status</span>
-                            <span class="info-val" id="wifiStatus">--</span>
-                        </div>
-                        <div class="info-row">
-                            <span class="info-key">Network (SSID)</span>
-                            <span class="info-val" id="wifiSsid">--</span>
-                        </div>
-                        <div class="info-row">
-                            <span class="info-key">IP Address</span>
-                            <span class="info-val" id="wifiIp">--</span>
-                        </div>
-                        <div class="info-row">
-                            <span class="info-key">Signal (RSSI)</span>
-                            <span class="info-val" id="wifiRssi">--</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- System Info Panel -->
-                <div class="panel" style="margin-top: 16px;">
-                    <h2>System Info</h2>
-                    <div class="info-rows">
-                        <div class="info-row">
-                            <span class="info-key">Firmware</span>
-                            <span class="info-val" id="sysFw">--</span>
-                        </div>
-                        <div class="info-row">
-                            <span class="info-key">ESP32 Chip</span>
-                            <span class="info-val" id="sysChip">--</span>
-                        </div>
-                        <div class="info-row">
-                            <span class="info-key">Uptime</span>
-                            <span class="info-val" id="sysUptime">--</span>
-                        </div>
-                        <div class="info-row">
-                            <span class="info-key">Total Welds</span>
-                            <span class="info-val" id="sysWelds">--</span>
-                        </div>
-                        <div class="info-row">
-                            <span class="info-key">Flash</span>
-                            <span class="info-val" id="sysFlash">--</span>
-                        </div>
-                        <div class="info-row">
-                            <span class="info-key">Free Heap</span>
-                            <span class="info-val" id="sysHeap">--</span>
-                        </div>
-                    </div>
-                </div>
             </div>
 
             <div>
